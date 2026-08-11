@@ -1,6 +1,11 @@
-output "table_name" {
-  description = "Set as TABLE_NAME on the API deployment."
-  value       = module.dynamodb.table_name
+output "table_names" {
+  description = "Tenant -> allowlist table. The API resolves its table from this."
+  value       = { for id, table in module.allowlist : id => table.table_name }
+}
+
+output "ip_sets" {
+  description = "IPSet name -> id and arn, for reference in WebACL rules."
+  value       = module.waf_ip_sets.ip_sets
 }
 
 output "function_name" {

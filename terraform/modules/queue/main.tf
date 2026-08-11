@@ -1,18 +1,13 @@
-// DynamoDB stream -> EventBridge Pipe -> SQS FIFO queue.
+// Per-tenant DynamoDB stream -> EventBridge Pipe -> one shared SQS FIFO queue.
 //
-// Streams cannot target SQS directly, so a Pipe does the hop. It is a managed
-// integration: no forwarder function to write, deploy or monitor.
-//
-// The queue is FIFO, keyed by tenant, which gives three things:
-//   - ordering per tenant: two edits from one tenant are never reordered
-//   - parallelism across tenants: Lambda scales FIFO by message group, so
-//     tenant C and tenant D reconcile at the same time
-//   - a real DLQ: the failed message itself is parked, and SQS can redrive it
-//     back to the source queue with one API call.
+// Streams cannot target SQS directly, so a Pipe does the hop - a managed
+// integration, no forwarder function to run. The queue is FIFO and grouped by
+// tenant: edits from one tenant stay ordered, different tenants reconcile in
+// parallel, and a failed message is parked on the DLQ for redrive.
 
 locals {
-  // The drift check has no tenant of its own, so it gets a group of its own.
-  // Tenant edits use the tenant id (see the pipe's target parameters).
+  // The drift check owns no list, so it gets a group of its own. Edits use the
+  // list owner id (see the pipe's target parameters).
   drift_check_group_id = "drift-check"
 }
 
@@ -49,11 +44,8 @@ resource "aws_sqs_queue" "main" {
 
 // ------------------------------------------------------------ Drift check
 //
-// Reconciliation only runs when a tenant edits their list, so a manual console
-// edit to an IPSet would survive until the next edit - potentially forever on a
-// quiet tenant. This schedule puts a message on the same queue, and because the
-// worker rebuilds from the tables, that reverts any change made outside the
-// application.
+// Edits alone would leave a manual console change to an IPSet in place until the
+// next edit. This schedule re-runs the worker, which rebuilds from the tables.
 
 resource "aws_cloudwatch_event_rule" "drift_check" {
   name                = "${var.name}-drift-check"
@@ -67,15 +59,13 @@ resource "aws_cloudwatch_event_target" "drift_check" {
   rule = aws_cloudwatch_event_rule.drift_check.name
   arn  = aws_sqs_queue.main.arn
 
-  // Its own group, so a full sweep runs alongside tenant edits rather than
-  // queueing behind them.
+  // Own group, so a sweep runs alongside tenant edits instead of behind them.
   sqs_target {
     message_group_id = local.drift_check_group_id
   }
 
-  // The queue deduplicates on content within a 5-minute window, so a fixed body
-  // would be swallowed on tighter schedules. Stamping the event time keeps each
-  // check distinct whatever the schedule is set to.
+  // Content dedup would swallow a fixed body within its 5-minute window, so
+  // stamp the event time to keep each check distinct.
   input_transformer {
     input_paths    = { time = "$.time" }
     input_template = "{\"source\":\"drift-check\",\"time\":<time>}"
@@ -134,7 +124,7 @@ data "aws_iam_policy_document" "pipe" {
       "dynamodb:GetShardIterator",
       "dynamodb:ListStreams",
     ]
-    resources = [var.stream_arn]
+    resources = values(var.stream_arns)
   }
 
   statement {
@@ -153,26 +143,18 @@ resource "aws_iam_role_policy" "pipe" {
 // ---------------------------------------------------------------- Pipe
 
 resource "aws_pipes_pipe" "stream_to_queue" {
-  name     = var.name
+  for_each = var.stream_arns
+
+  name     = "${var.name}-${each.key}"
   role_arn = aws_iam_role.pipe.arn
-  source   = var.stream_arn
+  source   = each.value
   target   = aws_sqs_queue.main.arn
 
   source_parameters {
-    /**
-     * Suppresses the worker's own acknowledgement writes.
-     *
-     * The API replaces the whole item on every write, so a tenant edit never
-     * carries `syncedVersion`. The worker's UpdateItem is the only thing that
-     * sets it. Forwarding only records without that attribute therefore means
-     * "tenant edits only", and the sync loop cannot feed itself.
-     *
-     * `exists` works on leaf nodes only, hence matching `syncedVersion.N`
-     * rather than `syncedVersion`.
-     *
-     * This depends on the API replacing rather than merging the item - see the
-     * note in backend/src/modules/ip-allowlist/repository.ts.
-     */
+    // Forwards tenant edits only, so the sync loop cannot feed itself: the API
+    // replaces the whole item (never carries `syncedVersion`), the worker's
+    // acknowledgement is the only write that sets it. `exists` needs a leaf
+    // node, hence `syncedVersion.N`. See backend ip-allowlist/repository.ts.
     filter_criteria {
       filter {
         pattern = jsonencode({
@@ -203,16 +185,11 @@ resource "aws_pipes_pipe" "stream_to_queue" {
 
   target_parameters {
     sqs_queue_parameters {
-      /**
-       * The group is the tenant, taken from the stream record at runtime -
-       * Pipes replaces a target parameter whose entire value is a JSON path.
-       *
-       * FIFO scales Lambda by message group, so edits from different tenants
-       * are processed in parallel while edits from one tenant stay ordered.
-       * Two tenants sharing an IPSet can therefore collide; the WAF lock token
-       * turns that into a retry rather than a lost update.
-       */
-      message_group_id = "$.dynamodb.Keys.tenantId.S"
+      // Group = the item key, resolved from the record at runtime (Pipes
+      // substitutes a value that is entirely a JSON path). Keeps one tenant's
+      // edits ordered while other tenants run in parallel; concurrent writers
+      // on a shared IPSet collide on the WAF lock token and retry.
+      message_group_id = "$.dynamodb.Keys.ownerId.S"
     }
   }
 

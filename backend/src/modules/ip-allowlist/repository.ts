@@ -3,42 +3,50 @@ import { DynamoDBDocumentClient, GetCommand, PutCommand } from '@aws-sdk/lib-dyn
 import { VersionConflictError } from '../../lib/errors.ts';
 
 export type Allowlist = {
-  tenantId: string;
+  ownerId: string;
   cidrs: string[];
   version: number;
   updatedAt: string;
-  updatedBy: string;
 
-  // Written by the sync worker once this version has reached AWS WAF. Absent
+  // Written by the sync worker once this version is live in AWS WAF. Absent
   // until then, which is what makes a new write PENDING by construction - a
   // stored status field could drift from reality; this cannot.
   syncedVersion?: number;
   syncedAt?: string;
 };
 
-export type AllowlistDraft = Omit<Allowlist, 'version' | 'updatedAt' | 'syncedVersion' | 'syncedAt'>;
+export type AllowlistDraft = { ownerId: string; cidrs: string[] };
 
 export interface AllowlistRepository {
-  get(tenantId: string): Promise<Allowlist | null>;
+  get(tenantId: string, ownerId: string): Promise<Allowlist | null>;
   /** Writes only if the stored version still matches `expectedVersion` (0 = create). */
-  put(draft: AllowlistDraft, expectedVersion: number): Promise<Allowlist>;
+  put(tenantId: string, draft: AllowlistDraft, expectedVersion: number): Promise<Allowlist>;
 }
 
-export function createDynamoRepository(tableName: string): AllowlistRepository {
+/** One table per tenant, named `<prefix>-<tenantId>` - the same name as its IPSet. */
+export function createDynamoRepository(tablePrefix: string): AllowlistRepository {
   const client = DynamoDBDocumentClient.from(new DynamoDBClient({}));
+  const tableOf = (tenantId: string) => `${tablePrefix}-${tenantId}`;
 
   return {
-    async get(tenantId) {
-      const { Item } = await client.send(new GetCommand({ TableName: tableName, Key: { tenantId } }));
+    async get(tenantId, ownerId) {
+      const { Item } = await client.send(
+        new GetCommand({
+          TableName: tableOf(tenantId),
+          Key: { ownerId },
+          // The caller is polling for the worker's acknowledgement, so a stale
+          // read would report PENDING on an already-applied list.
+          ConsistentRead: true,
+        }),
+      );
       return (Item as Allowlist | undefined) ?? null;
     },
 
-    async put(draft, expectedVersion) {
-      // PutItem replaces the whole item, so `syncedVersion` is dropped here and
-      // the new version starts out unacknowledged. The EventBridge Pipe filter
-      // relies on this: a record without `syncedVersion` is a tenant edit, one
-      // with it is the worker's own acknowledgement. Merging instead of
-      // replacing would make the worker stop seeing tenant changes.
+    async put(tenantId, draft, expectedVersion) {
+      // PutItem replaces the whole item, so `syncedVersion` is dropped and the
+      // new version starts unacknowledged. The Pipe filter relies on this: a
+      // record without `syncedVersion` is a user edit, one with it is the
+      // worker's own acknowledgement. Merging would hide edits from the worker.
       const item: Allowlist = {
         ...draft,
         version: expectedVersion + 1,
@@ -50,9 +58,9 @@ export function createDynamoRepository(tableName: string): AllowlistRepository {
       try {
         await client.send(
           new PutCommand({
-            TableName: tableName,
+            TableName: tableOf(tenantId),
             Item: item,
-            ConditionExpression: isCreate ? 'attribute_not_exists(tenantId)' : '#v = :expected',
+            ConditionExpression: isCreate ? 'attribute_not_exists(ownerId)' : '#v = :expected',
             ExpressionAttributeNames: isCreate ? undefined : { '#v': 'version' },
             ExpressionAttributeValues: isCreate ? undefined : { ':expected': expectedVersion },
           }),

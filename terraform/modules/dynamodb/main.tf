@@ -1,13 +1,13 @@
-// Desired state: one item per tenant. The stream is what triggers the sync
-// Lambda, so it is part of the contract rather than an optional extra.
+// One tenant's allowlist table. The stream triggers the sync worker, so it is
+// part of the contract, not an extra.
 
 resource "aws_dynamodb_table" "this" {
   name         = var.table_name
   billing_mode = "PAY_PER_REQUEST"
-  hash_key     = "tenantId"
+  hash_key     = "ownerId"
 
   attribute {
-    name = "tenantId"
+    name = "ownerId"
     type = "S"
   }
 

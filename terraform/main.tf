@@ -1,5 +1,5 @@
 locals {
-  name = "websg-cms-ip-allowlist"
+  name = "websg-cms-allowlist"
 
   tags = {
     Product     = "websg-custom"
@@ -7,37 +7,34 @@ locals {
     Environment = var.environment
     ManagedBy   = "terraform"
   }
+
+  // One tenant = one table + one IPSet, both named "<name>-<tenant>". Adding a
+  // tenant is an entry in var.tenants; no code change, no redeploy.
+  ip_set_names = { for id, t in var.tenants : id => "${local.name}-${id}" }
 }
 
-/**
- * Tenant onboarding. One entry per tenant in prod.tfvars creates its IPSet and
- * maps the tenant to it; the worker reads that mapping at runtime, so adding a
- * tenant needs no code change and no redeploy.
- *
- * Tenants sharing an ip_set_name share an IPSet and get the union of their
- * lists. Separate names give separate IPSets.
- */
-module "tenants" {
-  source = "./modules/tenants"
+// One allowlist table per tenant. Same module every time.
+module "allowlist" {
+  source   = "./modules/dynamodb"
+  for_each = var.tenants
 
-  tenants           = var.tenants
-  config_table_name = "${local.name}-tenants"
-  tags              = local.tags
-}
-
-module "dynamodb" {
-  source = "./modules/dynamodb"
-
-  table_name = local.name
+  table_name = local.ip_set_names[each.key]
   tags       = local.tags
+}
+
+module "waf_ip_sets" {
+  source = "./modules/waf_ip_sets"
+
+  ip_sets = { for id, t in var.tenants : local.ip_set_names[id] => t.ip_set_scope }
+  tags    = local.tags
 }
 
 module "queue" {
   source = "./modules/queue"
 
-  name       = "${local.name}-waf-sync"
-  stream_arn = module.dynamodb.stream_arn
-  tags       = local.tags
+  name        = "${local.name}-waf-sync"
+  stream_arns = { for id, table in module.allowlist : id => table.stream_arn }
+  tags        = local.tags
 }
 
 module "lambda" {
@@ -46,13 +43,19 @@ module "lambda" {
   function_name = "${local.name}-waf-sync"
   source_dir    = "${path.module}/../lambda/build"
 
-  queue_arn  = module.queue.queue_arn
-  table_name = module.dynamodb.table_name
-  table_arn  = module.dynamodb.table_arn
+  queue_arn = module.queue.queue_arn
 
-  config_table_name = module.tenants.config_table_name
-  config_table_arn  = module.tenants.config_table_arn
-  ip_set_arns       = module.tenants.ip_set_arns
+  // The worker's whole config: which table feeds which IPSet.
+  tenants = {
+    for id, t in var.tenants : id => {
+      tableName  = module.allowlist[id].table_name
+      tableArn   = module.allowlist[id].table_arn
+      ipSetId    = module.waf_ip_sets.ip_sets[local.ip_set_names[id]].id
+      ipSetName  = local.ip_set_names[id]
+      ipSetArn   = module.waf_ip_sets.ip_sets[local.ip_set_names[id]].arn
+      ipSetScope = t.ip_set_scope
+    }
+  }
 
   break_glass_cidrs = var.break_glass_cidrs
   tags              = local.tags

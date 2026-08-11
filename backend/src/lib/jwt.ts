@@ -1,52 +1,31 @@
-import { createRemoteJWKSet, jwtVerify } from 'jose';
+import { jwtVerify } from 'jose';
 import type { Config } from '../config/index.ts';
+import { tenantOf } from '../config/users.ts';
 
-export type Principal = {
-  subject: string;
-  tenantId: string;
-  scopes: string[];
-  isPlatformAdmin: boolean;
-};
-
+export type Principal = { userId: string; tenantId: string };
 export type TokenVerifier = (token: string) => Promise<Principal>;
 
-export const ADMIN_SCOPE = 'platform:admin';
-
 /**
- * Builds a verifier for the portal's OIDC access tokens.
- * Prefers a remote JWKS (Cognito user pool); falls back to an HS256 shared
- * secret so the service can run locally and under test without network access.
+ * Verifies a locally issued HS256 token (see `npm run token`) and resolves the
+ * caller's tenant from the user directory. The token proves who you are; the
+ * directory decides what you own.
  */
 export function createVerifier(config: Config): TokenVerifier {
-  const jwks = config.jwt.jwksUrl ? createRemoteJWKSet(new URL(config.jwt.jwksUrl)) : null;
-  const secret = jwks ? null : new TextEncoder().encode(requireSecret(config));
+  if (!config.jwt.secret) throw new Error('JWT_SECRET is required');
+  const secret = new TextEncoder().encode(config.jwt.secret);
 
   return async function verify(token) {
-    const options = {
+    const { payload } = await jwtVerify(token, secret, {
       issuer: config.jwt.issuer,
       audience: config.jwt.audience,
-      // Fixed algorithm list - never trust the token header's `alg`.
-      algorithms: jwks ? ['RS256'] : ['HS256'],
-    };
-    const { payload } = jwks
-      ? await jwtVerify(token, jwks, options)
-      : await jwtVerify(token, secret!, options);
+      // Fixed algorithm - never trust the token header's `alg`.
+      algorithms: ['HS256'],
+    });
 
-    const tenantId = String(payload.tenant_id ?? payload['custom:tenant_id'] ?? '');
-    const scopes = String(payload.scope ?? '').split(' ').filter(Boolean);
+    const userId = String(payload.sub ?? '');
+    const tenantId = tenantOf(userId);
+    if (!tenantId) throw new Error(`unknown user: ${userId}`);
 
-    return {
-      subject: String(payload.sub ?? ''),
-      tenantId,
-      scopes,
-      isPlatformAdmin: scopes.includes(ADMIN_SCOPE),
-    };
+    return { userId, tenantId };
   };
-}
-
-function requireSecret(config: Config): string {
-  if (!config.jwt.secret) {
-    throw new Error('Set JWT_JWKS_URL (production) or JWT_SECRET (local/test)');
-  }
-  return config.jwt.secret;
 }

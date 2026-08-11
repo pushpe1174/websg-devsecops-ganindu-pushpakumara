@@ -1,7 +1,20 @@
-// WAF sync worker: FIFO queue -> Lambda -> the existing WAF IPSet.
-//
-// Retries and the DLQ belong to the queue, so this module only owns the
-// function, its permissions and the event source mapping.
+// WAF sync worker: FIFO queue -> Lambda -> each tenant's WAF IPSet.
+// Retries and the DLQ belong to the queue module.
+
+locals {
+  table_arns  = [for t in var.tenants : t.tableArn]
+  ip_set_arns = distinct([for t in var.tenants : t.ipSetArn])
+
+  // Runtime config: which table feeds which IPSet.
+  tenant_config = {
+    for id, t in var.tenants : id => {
+      tableName  = t.tableName
+      ipSetId    = t.ipSetId
+      ipSetName  = t.ipSetName
+      ipSetScope = t.ipSetScope
+    }
+  }
+}
 
 terraform {
   required_providers {
@@ -42,7 +55,7 @@ data "aws_iam_policy_document" "this" {
   statement {
     sid       = "ReadAllTenantAllowlists"
     actions   = ["dynamodb:Scan"]
-    resources = [var.table_arn, var.config_table_arn]
+    resources = local.table_arns
   }
 
   // Records which version reached WAF, so the API can report APPLIED rather
@@ -50,7 +63,7 @@ data "aws_iam_policy_document" "this" {
   statement {
     sid       = "AcknowledgeAppliedVersion"
     actions   = ["dynamodb:UpdateItem"]
-    resources = [var.table_arn]
+    resources = local.table_arns
   }
 
   statement {
@@ -63,12 +76,11 @@ data "aws_iam_policy_document" "this" {
     resources = [var.queue_arn]
   }
 
-  // Scoped to exactly the tenant IPSets this worker owns - no wildcard WAF
-  // access, so it cannot touch any other WebACL's IPSets.
+  // Scoped to this worker's IPSets - no wildcard WAF access.
   statement {
     sid       = "ReconcileIpSets"
     actions   = ["wafv2:GetIPSet", "wafv2:UpdateIPSet"]
-    resources = var.ip_set_arns
+    resources = local.ip_set_arns
   }
 
   statement {
@@ -108,8 +120,7 @@ resource "aws_lambda_function" "this" {
 
   environment {
     variables = {
-      TABLE_NAME        = var.table_name
-      CONFIG_TABLE_NAME = var.config_table_name
+      TENANTS           = jsonencode(local.tenant_config)
       BREAK_GLASS_CIDRS = join(",", var.break_glass_cidrs)
     }
   }
@@ -125,11 +136,7 @@ resource "aws_lambda_event_source_mapping" "queue" {
   event_source_arn = var.queue_arn
   function_name    = aws_lambda_function.this.arn
 
-  // The queue has a single message group, so Lambda runs one invocation at a
-  // time. No reserved concurrency needed - FIFO ordering does that for us.
-  // A batch is one reconciliation regardless of size, so partial-failure
-  // reporting would be meaningless here: if the run fails, the whole batch
-  // returns to the queue and is redelivered, and after max_receive_count
-  // attempts SQS moves it to the DLQ.
+  // A batch is one reconciliation regardless of size: a failed run returns the
+  // whole batch to the queue, and the DLQ catches it after max_receive_count.
   batch_size = 10
 }

@@ -1,8 +1,0 @@
-# Local DynamoDB so the API can run without an AWS account.
-# The AWS SDK picks up AWS_ENDPOINT_URL from .env - no code change needed.
-services:
-  dynamodb:
-    image: amazon/dynamodb-local:latest
-    ports:
-      - '8000:8000'
-    command: ['-jar', 'DynamoDBLocal.jar', '-inMemory', '-sharedDb']

@@ -13,7 +13,7 @@
       "Condition": {
         "ArnNotEquals": {
           "aws:PrincipalArn": [
-            "arn:aws:iam::111122223333:role/websg-cms-ip-allowlist-waf-sync-role",
+            "arn:aws:iam::111122223333:role/websg-cms-allowlist-waf-sync-role",
             "arn:aws:iam::111122223333:role/websg-break-glass"
           ]
         }

@@ -1,24 +1,27 @@
 # Infrastructure
 
 ```
-DynamoDB stream -> EventBridge Pipe -> SQS FIFO -> Lambda -> WAF IPSet per tenant
-                        schedule (drift) ->  |                (or shared)
+Per-tenant DynamoDB stream -> EventBridge Pipe -> SQS FIFO -> Lambda -> that tenant's IPSet
+                        schedule (drift) ->  |
                                              +-> DLQ -> alarm -> SNS
 ```
 
 ```
 terraform/
-├── main.tf                  provider, backend, the four modules wired together
+├── main.tf                  provider, backend, the five modules wired together
 ├── variables.tf
 ├── outputs.tf
 ├── terraform.tfvars.example
 └── modules/
-    ├── tenants/             per-tenant IPSets + the tenant->IPSet mapping
-    ├── dynamodb/            table + stream
-    ├── queue/               EventBridge Pipe + FIFO queue + FIFO DLQ
+    ├── dynamodb/            one tenant's table + stream (called once per tenant)
+    ├── waf_ip_sets/         one IPSet per tenant
+    ├── queue/               one Pipe per stream + FIFO queue + FIFO DLQ
     ├── lambda/              function + IAM + event source mapping
     └── monitoring/          SNS topic + CloudWatch alarms
 ```
+
+Every table is created in `main.tf` from the same `dynamodb` module, so there is one place
+that owns tables. A tenant's table and its IPSet share a name: `websg-cms-allowlist-<key>`.
 
 The state bucket is created by the Makefile at the repo root, not by Terraform — a
 bootstrap stack would need its own state, which is the problem it is trying to solve.
@@ -57,18 +60,18 @@ able to reconfigure its own state.
 DynamoDB Streams cannot target SQS directly, so an **EventBridge Pipe** does the hop. It is
 a managed integration — no forwarder function to write, deploy or monitor.
 
-The queue is FIFO with a **single message group**, which buys three things:
+One Pipe per tenant stream, all targeting the same FIFO queue, which buys three things:
 
-- **Serial processing.** Lambda scales FIFO queues by message group; one group means one
-  invocation at a time. Concurrent tenant edits are applied one after another, with no
-  reserved-concurrency cap needed.
+- **Ordering where it matters.** Lambda scales FIFO by message group, so one item's edits
+  stay ordered while other tenants reconcile in parallel. Concurrent writers on one IPSet
+  collide on the WAF lock token and retry rather than losing an update.
 - **A real DLQ.** The failed *message* is parked, not a pointer to a stream position, so
   SQS's start-message-move (redrive) API can replay it to the source queue in one call.
 - **Retries decoupled from the stream.** A failing batch is redelivered by SQS instead of
   blocking a stream shard.
 
-The cost is one more hop and Pipe request charges. The reconciliation itself does not need
-ordering — it is a full rebuild — so the real win is serialisation plus the replayable DLQ.
+The cost is one more hop and Pipe request charges. The reconciliation itself is a full
+rebuild, so the real win is the replayable DLQ and retries decoupled from the stream.
 
 ## Onboarding a tenant
 
@@ -76,28 +79,24 @@ One entry in `prod.tfvars`, then apply:
 
 ```hcl
 tenants = {
-  agency-a = { ip_set_name = "websg-cms-allowlist-agency-a" }
-  agency-b = { ip_set_name = "websg-cms-allowlist-agency-b" }
+  tenant-a      = { description = "Agency A CMS" }
+  tenant-b      = { description = "Agency B CMS" }
+  tenant-shared = { description = "Agencies C and D, one shared IPSet" }
 }
 ```
 
-That creates the IPSet and writes a `tenantId -> ipSet` row to the mapping table. The worker
-reads the mapping at runtime, so **no code change and no redeploy** — a new tenant is a
-Terraform diff a reviewer can read.
+Each key creates a table and an IPSet named `websg-cms-allowlist-<key>`, plus the Pipe that
+connects them. The worker reads the mapping from its `TENANTS` environment variable, so
+onboarding is **no code change** — a Terraform diff a reviewer can read.
 
 | You want | Do this |
 | -------- | ------- |
-| Tenant gets its own IPSet | give it a unique `ip_set_name` |
-| Tenants share one IPSet | give them the same `ip_set_name` — the worker applies the union of their lists |
-| Adopt an IPSet created elsewhere | `create_ip_set = false` |
-| Split a shared tenant out later | change its `ip_set_name` and apply |
+| Tenant gets its own table and IPSet | add a key |
+| Agencies share one IPSet | put them in one tenant key — separate items in that table, union applied |
+| Split a shared agency out later | add its own key and move its item |
 
-The worker groups tenants by IPSet, so shared and per-tenant are the same code path rather
-than two modes. A tenant with no mapping is logged and left `PENDING` — its ranges are never
-applied to somebody else's IPSet.
-
-Isolation is enforced twice: the API already refuses cross-tenant writes, and the worker
-only ever puts a tenant's CIDRs into the IPSet its mapping names.
+Isolation is structural: one table feeds exactly one IPSet, so a tenant's ranges cannot
+reach another tenant's IPSet even if the API were wrong.
 
 ## Keeping WAF in the application's hands
 
@@ -121,13 +120,11 @@ Layer 3 prevents it, layer 2 repairs it, layer 1 stops your own pipeline from ca
 
 ## What this owns
 
-**Owns:** the allowlist table and stream, the tenant mapping table, the Pipe, the FIFO
-queue and its DLQ, the drift-check schedule, the Lambda and its role, the alarms and the
-SNS topic.
+**Owns:** each tenant's allowlist table and stream, the Pipes, the FIFO queue and its DLQ,
+the drift-check schedule, the Lambda and its role, the alarms and the SNS topic.
 
 **Owns, with a caveat:** the per-tenant IPSets — the resources, but never their
-`addresses`, which are ignored (see above). IPSets marked `create_ip_set = false` are read
-only.
+`addresses`, which are ignored (see above).
 
 **Does not own:** the WebACL, the EKS clusters or the ALB. The WebACL rules that reference
 these IPSets live wherever the CMS WebACL is declared.

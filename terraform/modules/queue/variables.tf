@@ -3,9 +3,9 @@ variable "name" {
   type        = string
 }
 
-variable "stream_arn" {
-  description = "DynamoDB stream ARN. The pipe's source."
-  type        = string
+variable "stream_arns" {
+  description = "Tenant -> DynamoDB stream ARN. One pipe per stream, all feeding the same queue."
+  type        = map(string)
 }
 
 variable "visibility_timeout_seconds" {

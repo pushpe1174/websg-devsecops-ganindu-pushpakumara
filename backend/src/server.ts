@@ -1,19 +1,17 @@
 import { buildApp } from './app.ts';
-import { assertProductionConfig, config } from './config/index.ts';
+import { assertConfig, config } from './config/index.ts';
 import { createVerifier } from './lib/jwt.ts';
 import { createDynamoRepository } from './modules/ip-allowlist/repository.ts';
-import { createDynamoTenantIpSetRepository } from './modules/tenant-ipset/repository.ts';
 
-assertProductionConfig(config);
+assertConfig(config);
 
 const app = buildApp({
-  repository: createDynamoRepository(config.aws.tableName),
-  tenantIpSets: createDynamoTenantIpSetRepository(config.aws.configTableName, config.aws.tableName),
+  repository: createDynamoRepository(config.aws.tablePrefix),
   verify: createVerifier(config),
   config,
 });
 
-// Let in-flight requests finish before the pod goes away.
+// Let in-flight requests finish before the process goes away.
 for (const signal of ['SIGTERM', 'SIGINT'] as const) {
   process.once(signal, () => {
     app.log.info({ signal }, 'shutting down');
