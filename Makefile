@@ -5,7 +5,7 @@ STATE_BUCKET ?= websg-custom-tfstate-273804046957
 TF           := terraform -chdir=terraform
 TF_VARS      ?= -var-file=prod.tfvars
 
-.PHONY: help state-bucket package init plan apply destroy fmt validate test
+.PHONY: help state-bucket package init plan apply destroy fmt validate test console
 
 help: ## Show the available targets
 	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'

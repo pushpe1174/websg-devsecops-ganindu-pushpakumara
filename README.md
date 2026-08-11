@@ -137,7 +137,8 @@ Everything else in `.env.example` has a working default.
 npm run dev           # http://localhost:3000, watch mode
 ```
 
-In a second terminal, mint a token and use it. Users come from
+In a second terminal — `cd backend` again, since `npm run token` needs the package
+scripts — mint a token and use it. Users come from
 [src/config/users.ts](backend/src/config/users.ts) — the token proves who you are, the
 directory decides which tenant you own, so a forged claim cannot reach another tenant:
 
@@ -155,16 +156,27 @@ export TOKEN=$(npm run token --silent -- user-a)
 # Read the current list (a new user gets an empty list at version 0)
 curl -s $API/v1/allowlist -H "authorization: Bearer $TOKEN"
 
-# Replace it. If-Match carries the version you last read.
+# Replace it. If-Match carries the version you last read - 0 here because the
+# list above is new. It is required on every PUT; without it the answer is 428.
 curl -isX PUT $API/v1/allowlist \
   -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
   -H 'if-match: 0' \
   -d '{"cidrs":["203.0.113.9","198.51.100.0/24"]}'
 ```
 
+If `$TOKEN` is empty the API answers `{"error":"missing bearer token"}` — that means
+`npm run token` ran outside `backend/`, not that the token was rejected.
+
 The write returns the stored record with `version: 1` and the normalised list
 `["198.51.100.0/24","203.0.113.9/32"]`, plus an `ETag` header carrying the new version —
-send that as the next `If-Match`.
+send that as the next `If-Match`, so a write never needs a re-read:
+
+```bash
+V=$(curl -s $API/v1/allowlist -H "authorization: Bearer $TOKEN" | jq -r .version)
+curl -sX PUT $API/v1/allowlist \
+  -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -H "if-match: $V" -d '{"cidrs":["203.0.113.0/24"]}'
+```
 
 ### 4. Check the scenarios
 
@@ -229,6 +241,12 @@ Content-Type: application/json
 
 { "cidrs": ["203.0.113.9", "198.51.100.0/24"] }
 ```
+
+`If-Match` is mandatory — there is no unconditional write. It must be a non-negative
+integer: the version you last read, or `0` for the first write to a list that does not
+exist yet. The value becomes the DynamoDB condition on the write
+([repository.ts](backend/src/modules/ip-allowlist/repository.ts)), which is what makes a
+lost update impossible rather than merely unlikely.
 
 Responses:
 
