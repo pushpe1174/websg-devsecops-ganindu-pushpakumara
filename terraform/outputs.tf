@@ -1,5 +1,16 @@
+// The two values the API needs in its .env; everything else it derives.
+output "table_prefix" {
+  description = "Set as TABLE_PREFIX on the API. It resolves a tenant's table as <prefix>-<tenantId>."
+  value       = local.name
+}
+
+output "region" {
+  description = "Set as AWS_REGION on the API."
+  value       = var.region
+}
+
 output "table_names" {
-  description = "Tenant -> allowlist table. The API resolves its table from this."
+  description = "Tenant -> allowlist table, for confirming what was created."
   value       = { for id, table in module.allowlist : id => table.table_name }
 }
 

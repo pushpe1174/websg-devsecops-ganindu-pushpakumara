@@ -8,10 +8,11 @@ Per-tenant DynamoDB stream -> EventBridge Pipe -> SQS FIFO -> Lambda -> that ten
 
 ```
 terraform/
-├── main.tf                  provider, backend, the five modules wired together
+├── providers.tf             required versions, the AWS provider, the S3 backend
+├── main.tf                  the five modules wired together
 ├── variables.tf
 ├── outputs.tf
-├── terraform.tfvars.example
+├── prod.tfvars              the tenants, break-glass ranges and alert addresses
 └── modules/
     ├── dynamodb/            one tenant's table + stream (called once per tenant)
     ├── waf_ip_sets/         one IPSet per tenant
@@ -49,7 +50,7 @@ automatically before plan and apply, because a stale package means Terraform see
 change and silently deploys the old function.
 
 Before the first apply, edit `terraform/prod.tfvars` (real break-glass ranges, real alert
-addresses) and set `bucket` in the backend block of `main.tf` to your bucket name.
+addresses) and set `bucket` in the backend block of `providers.tf` to your bucket name.
 
 The deploy role's permissions are in [iam/terraform-deploy-policy.json](../iam/README.md).
 Creating the state bucket is deliberately outside that policy — the pipeline should not be
@@ -62,9 +63,10 @@ a managed integration — no forwarder function to write, deploy or monitor.
 
 One Pipe per tenant stream, all targeting the same FIFO queue, which buys three things:
 
-- **Ordering where it matters.** Lambda scales FIFO by message group, so one item's edits
-  stay ordered while other tenants reconcile in parallel. Concurrent writers on one IPSet
-  collide on the WAF lock token and retry rather than losing an update.
+- **Ordering where it matters.** The message group is the list owner (`ownerId`), and Lambda
+  scales FIFO by message group, so one user's edits stay ordered while everyone else
+  reconciles in parallel. Concurrent writers on one shared IPSet collide on the WAF lock
+  token and retry rather than losing an update.
 - **A real DLQ.** The failed *message* is parked, not a pointer to a stream position, so
   SQS's start-message-move (redrive) API can replay it to the source queue in one call.
 - **Retries decoupled from the stream.** A failing batch is redelivered by SQS instead of
@@ -75,7 +77,9 @@ rebuild, so the real win is the replayable DLQ and retries decoupled from the st
 
 ## Onboarding a tenant
 
-One entry in `prod.tfvars`, then apply:
+One entry in `prod.tfvars`, then apply. (Until a real IdP is wired in, a new *user* also
+needs an entry in `backend/src/config/users.ts` — see
+[ARCHITECTURE.md](../ARCHITECTURE.md#scenario-10--onboarding-a-tenant).)
 
 ```hcl
 tenants = {
@@ -131,16 +135,18 @@ these IPSets live wherever the CMS WebACL is declared.
 
 ## Concurrent triggers
 
-Ten tenants saving at the same moment produce ten stream records. Four things keep that from
-corrupting the IPSet:
+Ten users saving at the same moment produce ten stream records. Four things keep that from
+corrupting an IPSet:
 
 1. **Pipe batching** — records are gathered for up to 5 seconds, so a burst usually becomes
    one message rather than ten.
-2. **FIFO single message group** — SQS delivers one batch at a time and holds the rest,
-   so the function never runs against itself.
+2. **FIFO message groups** — the group is the list owner, so one user's edits are delivered
+   one batch at a time and can never run against themselves, while different owners proceed
+   in parallel.
 3. **Full reconciliation** — the handler ignores message contents and rebuilds the IPSet
    from a strongly consistent `Scan` of the whole table. Runs converge in any order,
-   because the operation is a rebuild rather than an increment.
+   because the operation is a rebuild rather than an increment. This is what makes two
+   agencies sharing a table safe: whoever runs second still writes the union.
 4. **WAF lock token** — `GetIPSet` returns a `LockToken` that `UpdateIPSet` must present.
    Anything that changed in between causes `WAFOptimisticLockException`, so a concurrent
    writer can never silently clobber; the message returns to the queue and is redelivered.
@@ -151,11 +157,14 @@ write that triggered the run, publishing an IPSet that stays stale until the nex
 
 ## Confirming a change is live
 
-The API returns **202 Accepted** on a write: the list is stored, but not yet in WAF. After a
-successful `UpdateIPSet` the worker writes `syncedVersion` and `syncedAt` back to each
-tenant item, and the API derives `syncStatus` from them — `APPLIED` when
-`syncedVersion == version`, `PENDING` otherwise. The portal polls GET until it reads
-`APPLIED`.
+After a successful `UpdateIPSet` the worker writes `syncedVersion` and `syncedAt` back to
+each item it reconciled, and the API derives `syncStatus` from them — `APPLIED` when
+`syncedVersion == version`, `PENDING` otherwise.
+
+A write holds the request open for up to `SYNC_WAIT_MS` waiting for that acknowledgement, so
+it normally answers **200** with `syncStatus: APPLIED`. If the window elapses first it
+answers **202** with `PENDING` — stored and durable, not yet enforced — and the portal polls
+GET until it reads `APPLIED`.
 
 The status is derived, never stored, so it cannot drift from the data. Two details make it
 trustworthy:
@@ -204,13 +213,13 @@ moves the message to the FIFO DLQ, and the alarm fires.
 | `…-errors` | function errors in 5 minutes | failing but still retrying — catch it before the DLQ |
 
 The DLQ alarm is the important one: nothing on the API side fails when sync stalls. Tenants
-keep getting `202`s while their changes quietly stop reaching WAF, and `syncStatus` stays
+keep saving successfully while their changes quietly stop reaching WAF, and `syncStatus` stays
 PENDING.
 
 ### Runbook: the DLQ alarm fired
 
 1. Inspect: `aws sqs receive-message --queue-url $(terraform -chdir=terraform output -raw dlq_url)`
-2. Check `/aws/lambda/websg-cms-ip-allowlist-waf-sync` around that timestamp. Usual causes
+2. Check `/aws/lambda/websg-cms-allowlist-waf-sync` around that timestamp. Usual causes
    are WAF throttling or the IPSet hitting its address limit.
 3. Fix the cause, then **redrive** — SQS replays the parked messages to the source queue:
    ```bash

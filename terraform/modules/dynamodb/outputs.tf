@@ -1,5 +1,5 @@
 output "table_name" {
-  description = "Table name. Set as TABLE_NAME on the API and the Lambda."
+  description = "Table name, <prefix>-<tenant>. The worker gets it via TENANTS; the API derives it from TABLE_PREFIX."
   value       = aws_dynamodb_table.this.name
 }
 

@@ -69,7 +69,7 @@ export function createAllowlistService(
  * Derived, never stored: the worker only records which version it applied, so
  * the status cannot disagree with the data it is computed from.
  */
-export function view(tenantId: string, record: Allowlist): AllowlistView {
+function view(tenantId: string, record: Allowlist): AllowlistView {
   return {
     ...record,
     tenantId,

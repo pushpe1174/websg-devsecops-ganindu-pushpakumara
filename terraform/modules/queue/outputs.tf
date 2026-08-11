@@ -3,11 +3,6 @@ output "queue_arn" {
   value       = aws_sqs_queue.main.arn
 }
 
-output "queue_name" {
-  description = "FIFO queue name."
-  value       = aws_sqs_queue.main.name
-}
-
 output "queue_url" {
   description = "FIFO queue URL, for checking backlog depth."
   value       = aws_sqs_queue.main.url

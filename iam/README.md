@@ -1,10 +1,10 @@
 # IAM policies
 
-Two policies, both least-privilege and scoped to named resources rather than `*`. Replace
-`111122223333` with the account id and `ap-southeast-1` with the region before attaching:
+Three policies, all least-privilege and scoped to named resources rather than `*`. They are
+written against account `273804046957` in `ap-southeast-1`; retarget them before attaching:
 
 ```bash
-sed -i '' 's/111122223333/<account-id>/g' iam/*.json
+sed -i '' 's/273804046957/<account-id>/g;s/ap-southeast-1/<region>/g' iam/*.json
 ```
 
 ## `terraform-deploy-policy.json`
@@ -19,7 +19,7 @@ Notable restrictions:
 - **`iam:PassRole` is conditioned** on `iam:PassedToService` being Lambda or Pipes. Without
   that condition, permission to create a role plus permission to pass it anywhere is a
   privilege-escalation path to any service.
-- **Role management is name-scoped** to `websg-cms-ip-allowlist-*`, so it cannot touch
+- **Role management is name-scoped** to `websg-cms-allowlist-*`, so it cannot touch
   unrelated roles.
 - **WAF access covers creating IPSets but not writing addresses to them.** The pipeline
   creates the per-tenant IPSets; only the sync Lambda writes their contents, at runtime.
@@ -80,14 +80,13 @@ allowlist is wrong, someone needs a way to edit WAF directly.
 
 ## `backend-api-policy.json`
 
-Everything the API can do, on two tables. It never touches WAF, SQS or the stream; it only
-records desired state and the tenant → IPSet mapping.
+Everything the API can do: `dynamodb:GetItem` and `PutItem` on `websg-cms-allowlist-*`. It
+never touches WAF, SQS or the streams — it only records desired state, and the worker is the
+single writer to WAF.
 
-- **Allowlist table**: `GetItem`, `PutItem`, `UpdateItem`. No `Scan` — a leaked credential
-  cannot dump every tenant's allowlist. `UpdateItem` exists only so an admin reassignment
-  can clear the tenant's acknowledgement and trigger a re-sync.
-- **Mapping table**: `GetItem`, `PutItem`, `DeleteItem`, `Scan`. `Scan` is needed for the
-  admin list endpoint; that table holds no tenant data, only which IPSet backs whom.
+There is deliberately **no `Scan`**, so a leaked credential cannot dump every user's
+allowlist, and no `UpdateItem`: a write replaces the whole item, which is what keeps the
+worker's `syncedVersion` off tenant edits and lets the Pipe filter tell the two apart.
 
-Use it in two places: attached to the pod's IRSA role, and attached to a dedicated IAM user
-or role when running the backend locally against real AWS.
+Use it in two places: attached to the pod's IRSA role, and attached to the credentials used
+when running the backend locally (see [Running it](../README.md#running-it)).

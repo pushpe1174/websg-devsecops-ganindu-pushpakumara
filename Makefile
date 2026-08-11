@@ -34,7 +34,7 @@ state-bucket: ## Create the S3 bucket holding Terraform state (run once per acco
 		--bucket $(STATE_BUCKET) \
 		--public-access-block-configuration \
 		'BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true'
-	@echo "Done. Set bucket = \"$(STATE_BUCKET)\" in terraform/main.tf"
+	@echo "Done. Set bucket = \"$(STATE_BUCKET)\" in terraform/providers.tf"
 
 package: ## Build the Lambda deployment package (required before plan/apply)
 	cd lambda && npm run package

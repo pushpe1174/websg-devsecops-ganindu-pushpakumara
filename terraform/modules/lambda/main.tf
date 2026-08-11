@@ -32,8 +32,6 @@ data "archive_file" "this" {
   output_path = "${path.module}/.build/${var.function_name}.zip"
 }
 
-// ---------------------------------------------------------------- IAM
-
 data "aws_iam_policy_document" "assume_role" {
   statement {
     actions = ["sts:AssumeRole"]
