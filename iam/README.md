@@ -1,0 +1,93 @@
+# IAM policies
+
+Two policies, both least-privilege and scoped to named resources rather than `*`. Replace
+`111122223333` with the account id and `ap-southeast-1` with the region before attaching:
+
+```bash
+sed -i '' 's/111122223333/<account-id>/g' iam/*.json
+```
+
+## `terraform-deploy-policy.json`
+
+Attached to the role GitLab CI assumes to run `terraform apply`. It can manage exactly the
+resources in [terraform/](../terraform), and nothing else.
+
+Notable restrictions:
+
+- **State access is prefix-scoped** to `websg-custom/*` in the state bucket, so this role
+  cannot read or overwrite another product's state in the same bucket.
+- **`iam:PassRole` is conditioned** on `iam:PassedToService` being Lambda or Pipes. Without
+  that condition, permission to create a role plus permission to pass it anywhere is a
+  privilege-escalation path to any service.
+- **Role management is name-scoped** to `websg-cms-ip-allowlist-*`, so it cannot touch
+  unrelated roles.
+- **WAF access covers creating IPSets but not writing addresses to them.** The pipeline
+  creates the per-tenant IPSets; only the sync Lambda writes their contents, at runtime.
+- Event source mapping actions are not resource-scoped by AWS, so they are constrained with
+  a `lambda:FunctionArn` condition instead.
+
+Bootstrap note: creating the state bucket (`make state-bucket`) needs `s3:CreateBucket` and
+`s3:Put*` on the bucket, which is deliberately **not** in this policy. Run it once as an
+administrator; the pipeline should never be able to create or reconfigure its own state
+bucket.
+
+Trust policy for GitLab OIDC (replace `gitlab.com` and the project path):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Federated": "arn:aws:iam::111122223333:oidc-provider/gitlab.com" },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {
+      "StringEquals": {
+        "gitlab.com:aud": "https://gitlab.com"
+      },
+      "StringLike": {
+        "gitlab.com:sub": "project_path:your-group/websg-custom:ref_type:branch:ref:main"
+      }
+    }
+  }]
+}
+```
+
+The `sub` condition pins the role to one branch of one project. Without it, any project in
+the GitLab instance could assume it.
+
+## `deny-manual-ipset-edits.json`
+
+Attach as an **SCP** on the account's OU, or as a permissions boundary. It denies
+`wafv2:UpdateIPSet` on the CMS IPSets to every principal except the sync worker's role and
+a named break-glass role.
+
+This is the control that actually makes the application the only writer. An explicit `Deny`
+beats any `Allow`, including an administrator's, so a console edit fails outright rather
+than being silently reverted later.
+
+It pairs with two other layers, which matter because a deny alone is not enough:
+
+- **`ignore_changes = [addresses]`** on every `aws_wafv2_ip_set` — without it, `terraform
+  apply` resets the addresses to the empty list in the resource and locks every tenant out
+  until the next sync. Terraform owns the resource; the application owns its contents.
+- **The scheduled drift check** (default every 15 minutes) — the reconciler rebuilds each
+  IPSet from the table, so anything that did get changed outside the application is undone
+  on the next run. Without the schedule, drift on a quiet tenant would survive until their
+  next edit.
+
+Keep the break-glass role in the exception list. If the sync path is broken *and* the
+allowlist is wrong, someone needs a way to edit WAF directly.
+
+## `backend-api-policy.json`
+
+Everything the API can do, on two tables. It never touches WAF, SQS or the stream; it only
+records desired state and the tenant → IPSet mapping.
+
+- **Allowlist table**: `GetItem`, `PutItem`, `UpdateItem`. No `Scan` — a leaked credential
+  cannot dump every tenant's allowlist. `UpdateItem` exists only so an admin reassignment
+  can clear the tenant's acknowledgement and trigger a re-sync.
+- **Mapping table**: `GetItem`, `PutItem`, `DeleteItem`, `Scan`. `Scan` is needed for the
+  admin list endpoint; that table holds no tenant data, only which IPSet backs whom.
+
+Use it in two places: attached to the pod's IRSA role, and attached to a dedicated IAM user
+or role when running the backend locally against real AWS.

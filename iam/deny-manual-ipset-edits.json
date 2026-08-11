@@ -1,0 +1,23 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "OnlyTheSyncWorkerMayEditCmsIpSets",
+      "Effect": "Deny",
+      "Action": [
+        "wafv2:UpdateIPSet",
+        "wafv2:DeleteIPSet",
+        "wafv2:PutLoggingConfiguration"
+      ],
+      "Resource": "arn:aws:wafv2:ap-southeast-1:111122223333:regional/ipset/websg-cms-allowlist-*/*",
+      "Condition": {
+        "ArnNotEquals": {
+          "aws:PrincipalArn": [
+            "arn:aws:iam::111122223333:role/websg-cms-ip-allowlist-waf-sync-role",
+            "arn:aws:iam::111122223333:role/websg-break-glass"
+          ]
+        }
+      }
+    }
+  ]
+}
