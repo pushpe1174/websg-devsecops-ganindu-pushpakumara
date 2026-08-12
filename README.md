@@ -1,6 +1,6 @@
 # WebSG CMS IP allowlist
 
-Document link -> 
+Document link -> https://docs.google.com/document/d/15rFJF1WpNCexkGvBt9R0nlR4XqkGQeFU/edit?usp=sharing&ouid=116210989873019604332&rtpof=true&sd=true
 
 A tenant edits their own list of allowed IP ranges; the ranges end up in an AWS
 WAF IPSet in front of their CMS.
