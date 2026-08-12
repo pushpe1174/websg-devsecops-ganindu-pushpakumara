@@ -1,9 +1,18 @@
 const num = (value: string | undefined, fallback: number) => (value ? Number(value) : fallback);
+const list = (value: string): string[] =>
+  value
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
 
 export const config = {
   port: num(process.env.PORT, 3000),
   host: process.env.HOST ?? '0.0.0.0',
   logLevel: process.env.LOG_LEVEL ?? 'info',
+
+  corsOrigins: list(process.env.CORS_ORIGINS ?? 'http://localhost:5173'),
+
+  devLoginTtl: process.env.DEV_LOGIN_TTL ?? '1h',
 
   aws: {
     // One table for every tenant: PK = tenantId, SK = ownerId.

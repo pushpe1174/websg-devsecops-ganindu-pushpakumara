@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="no-referrer" />
+    <title>IP allowlist</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main id="login" class="screen" hidden>
+      <form class="card" id="login-form">
+        <h1>IP allowlist</h1>
+        <p class="muted">Choose an account to continue.</p>
+        <label for="user">Account</label>
+        <select id="user" name="user" required></select>
+        <button type="submit" class="primary" id="login-submit">Continue</button>
+        <p class="error" id="login-error" hidden></p>
+      </form>
+    </main>
+
+    <div id="app" hidden>
+      <header class="bar">
+        <div>
+          <strong id="who"></strong>
+          <span class="muted" id="tenant"></span>
+        </div>
+        <button type="button" class="link" id="signout">Sign out</button>
+      </header>
+
+      <main class="panel">
+        <div class="panel-head">
+          <h2>Allowed addresses</h2>
+          <span class="muted" id="meta"></span>
+        </div>
+
+        <ul id="list" class="list"></ul>
+        <p class="muted" id="empty" hidden>No addresses yet.</p>
+
+        <form id="add-form" class="add">
+          <input
+            id="cidr"
+            name="cidr"
+            type="text"
+            placeholder="203.0.113.0/24"
+            autocomplete="off"
+            spellcheck="false"
+            maxlength="43"
+          />
+          <button type="submit">Add</button>
+        </form>
+
+        <p class="error" id="error" hidden></p>
+
+        <div class="actions">
+          <button type="button" class="link" id="reset" disabled>Discard changes</button>
+          <button type="button" class="primary" id="save" disabled>Save changes</button>
+        </div>
+      </main>
+    </div>
+
+    <dialog id="result">
+      <h2 id="result-title"></h2>
+      <p class="muted" id="result-note"></p>
+      <ul id="result-list" class="list plain"></ul>
+      <form method="dialog">
+        <button class="primary">Close</button>
+      </form>
+    </dialog>
+
+    <div id="loading" class="overlay" hidden>
+      <div class="spinner" aria-hidden="true"></div>
+      <p id="loading-text">Saving…</p>
+    </div>
+
+    <script src="app.js"></script>
+  </body>
+</html>

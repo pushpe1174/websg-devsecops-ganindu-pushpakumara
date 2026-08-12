@@ -1,3 +1,4 @@
+import cors from '@fastify/cors';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { config as defaultConfig, type Config } from './config/index.ts';
 import type { TokenVerifier } from './lib/jwt.ts';
@@ -7,6 +8,7 @@ import type { SyncNotifier } from './modules/ip-allowlist/notifier.ts';
 import { createAllowlistService } from './modules/ip-allowlist/service.ts';
 import { registerAuthentication } from './plugins/auth.ts';
 import { registerErrorHandler } from './plugins/error-handler.ts';
+import { authRoutes } from './routes/auth.ts';
 import { healthRoutes } from './routes/health.ts';
 
 export type AppOptions = {
@@ -29,7 +31,19 @@ export function buildApp(options: AppOptions): FastifyInstance {
   });
 
   registerErrorHandler(app);
+
+  app.register(cors, {
+    origin: config.corsOrigins.length > 0 ? config.corsOrigins : false,
+    methods: ['GET', 'PUT', 'POST', 'OPTIONS'],
+    allowedHeaders: ['authorization', 'content-type', 'if-match'],
+    exposedHeaders: ['etag'],
+    credentials: false,
+    maxAge: 600,
+  });
+
   app.register(healthRoutes);
+
+  app.register(authRoutes(config));
 
   // Everything under /v1 is authenticated; health stays outside this scope.
   app.register(

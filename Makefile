@@ -5,7 +5,9 @@ STATE_BUCKET ?= websg-custom-tfstate-273804046957
 TF           := terraform -chdir=terraform
 TF_VARS      ?= -var-file=prod.tfvars
 
-.PHONY: help state-bucket package init plan apply destroy fmt validate test console
+.PHONY: help state-bucket package init plan apply destroy fmt validate test console frontend
+
+FRONTEND_PORT ?= 5173
 
 help: ## Show the available targets
 	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
@@ -56,6 +58,10 @@ fmt: ## Format the Terraform files
 
 validate: ## Validate the Terraform configuration
 	$(TF) validate
+
+frontend: ## Serve the self-service portal (needs the API running with CORS_ORIGINS matching)
+	@echo "Portal on http://localhost:$(FRONTEND_PORT) - API expected on http://localhost:3000"
+	python3 -m http.server $(FRONTEND_PORT) --directory frontend --bind 127.0.0.1
 
 test: ## Run the backend and lambda test suites
 	cd backend && npm test

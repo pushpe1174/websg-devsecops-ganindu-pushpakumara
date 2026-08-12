@@ -83,12 +83,15 @@ export function createMemoryNotifier(options: { fail?: boolean } = {}): MemoryNo
 export function buildTestApp(
   repository: AllowlistRepository = createMemoryRepository(),
   notifier: SyncNotifier = createMemoryNotifier(),
+  overrides: Partial<typeof testConfig> = {},
 ) {
+  const config = { ...testConfig, ...overrides };
+
   return buildApp({
     repository,
     notifier,
-    verify: createVerifier(testConfig),
-    config: testConfig,
+    verify: createVerifier(config),
+    config,
     logger: false,
   });
 }
