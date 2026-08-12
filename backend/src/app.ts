@@ -3,6 +3,7 @@ import { config as defaultConfig, type Config } from './config/index.ts';
 import type { TokenVerifier } from './lib/jwt.ts';
 import { ipAllowlistRoutes } from './modules/ip-allowlist/routes.ts';
 import type { AllowlistRepository } from './modules/ip-allowlist/repository.ts';
+import type { SyncNotifier } from './modules/ip-allowlist/notifier.ts';
 import { createAllowlistService } from './modules/ip-allowlist/service.ts';
 import { registerAuthentication } from './plugins/auth.ts';
 import { registerErrorHandler } from './plugins/error-handler.ts';
@@ -10,6 +11,7 @@ import { healthRoutes } from './routes/health.ts';
 
 export type AppOptions = {
   repository: AllowlistRepository;
+  notifier: SyncNotifier;
   verify: TokenVerifier;
   config?: Config;
   logger?: boolean;
@@ -29,11 +31,17 @@ export function buildApp(options: AppOptions): FastifyInstance {
   registerErrorHandler(app);
   app.register(healthRoutes);
 
-  // Everything under /v1 is authenticated; health routes stay outside this scope.
+  // Everything under /v1 is authenticated; health stays outside this scope.
   app.register(
     async (api) => {
       registerAuthentication(api, options.verify);
-      await api.register(ipAllowlistRoutes(createAllowlistService(options.repository, config)));
+      const service = createAllowlistService({
+        repository: options.repository,
+        notifier: options.notifier,
+        config,
+        logger: api.log,
+      });
+      await api.register(ipAllowlistRoutes(service));
     },
     { prefix: '/v1' },
   );

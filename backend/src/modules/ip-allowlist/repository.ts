@@ -7,10 +7,6 @@ export type Allowlist = {
   cidrs: string[];
   version: number;
   updatedAt: string;
-
-  // Written by the sync worker once this version is live in AWS WAF. Absent
-  // until then, which is what makes a new write PENDING by construction - a
-  // stored status field could drift from reality; this cannot.
   syncedVersion?: number;
   syncedAt?: string;
 };
@@ -19,23 +15,22 @@ export type AllowlistDraft = { ownerId: string; cidrs: string[] };
 
 export interface AllowlistRepository {
   get(tenantId: string, ownerId: string): Promise<Allowlist | null>;
-  /** Writes only if the stored version still matches `expectedVersion` (0 = create). */
   put(tenantId: string, draft: AllowlistDraft, expectedVersion: number): Promise<Allowlist>;
 }
 
-/** One table per tenant, named `<prefix>-<tenantId>` - the same name as its IPSet. */
-export function createDynamoRepository(tablePrefix: string): AllowlistRepository {
+/**
+ * One table: PK = tenantId, SK = ownerId. A tenant is a partition, so the worker
+ * reads one with a Query instead of scanning the platform.
+ */
+export function createDynamoRepository(tableName: string): AllowlistRepository {
   const client = DynamoDBDocumentClient.from(new DynamoDBClient({}));
-  const tableOf = (tenantId: string) => `${tablePrefix}-${tenantId}`;
 
   return {
     async get(tenantId, ownerId) {
       const { Item } = await client.send(
         new GetCommand({
-          TableName: tableOf(tenantId),
-          Key: { ownerId },
-          // The caller is polling for the worker's acknowledgement, so a stale
-          // read would report PENDING on an already-applied list.
+          TableName: tableName,
+          Key: { tenantId, ownerId },
           ConsistentRead: true,
         }),
       );
@@ -43,10 +38,6 @@ export function createDynamoRepository(tablePrefix: string): AllowlistRepository
     },
 
     async put(tenantId, draft, expectedVersion) {
-      // PutItem replaces the whole item, so `syncedVersion` is dropped and the
-      // new version starts unacknowledged. The Pipe filter relies on this: a
-      // record without `syncedVersion` is a user edit, one with it is the
-      // worker's own acknowledgement. Merging would hide edits from the worker.
       const item: Allowlist = {
         ...draft,
         version: expectedVersion + 1,
@@ -58,8 +49,8 @@ export function createDynamoRepository(tablePrefix: string): AllowlistRepository
       try {
         await client.send(
           new PutCommand({
-            TableName: tableOf(tenantId),
-            Item: item,
+            TableName: tableName,
+            Item: { tenantId, ...item },
             ConditionExpression: isCreate ? 'attribute_not_exists(ownerId)' : '#v = :expected',
             ExpressionAttributeNames: isCreate ? undefined : { '#v': 'version' },
             ExpressionAttributeValues: isCreate ? undefined : { ':expected': expectedVersion },

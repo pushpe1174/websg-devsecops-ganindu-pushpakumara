@@ -6,9 +6,9 @@ export type Principal = { userId: string; tenantId: string };
 export type TokenVerifier = (token: string) => Promise<Principal>;
 
 /**
- * Verifies a locally issued HS256 token (see `npm run token`) and resolves the
- * caller's tenant from the user directory. The token proves who you are; the
- * directory decides what you own.
+ * Verifies a locally issued HS256 token (`npm run token`) and resolves the
+ * tenant from the directory: the token proves who you are, the directory decides
+ * what you own.
  */
 export function createVerifier(config: Config): TokenVerifier {
   if (!config.jwt.secret) throw new Error('JWT_SECRET is required');
@@ -18,7 +18,6 @@ export function createVerifier(config: Config): TokenVerifier {
     const { payload } = await jwtVerify(token, secret, {
       issuer: config.jwt.issuer,
       audience: config.jwt.audience,
-      // Fixed algorithm - never trust the token header's `alg`.
       algorithms: ['HS256'],
     });
 

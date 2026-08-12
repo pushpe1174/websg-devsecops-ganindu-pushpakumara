@@ -5,7 +5,6 @@ export const replaceBodySchema = {
   properties: {
     cidrs: {
       type: 'array',
-      // Structural cap only; the policy cap lives in config.
       maxItems: 200,
       items: { type: 'string', minLength: 1, maxLength: 43 },
     },
@@ -20,7 +19,6 @@ export const allowlistResponseSchema = {
     cidrs: { type: 'array', items: { type: 'string' } },
     version: { type: 'integer' },
     updatedAt: { type: 'string' },
-    // APPLIED = confirmed live in WAF. PENDING = stored, not yet confirmed.
     syncStatus: { type: 'string', enum: ['PENDING', 'APPLIED'] },
     syncedVersion: { type: 'integer' },
     syncedAt: { type: 'string' },
@@ -31,7 +29,6 @@ export const errorResponseSchema = {
   type: 'object',
   properties: {
     error: { type: 'string' },
-    // Present on validation failures: one entry per rejected value.
     reasons: { type: 'array', items: { type: 'string' } },
   },
 } as const;

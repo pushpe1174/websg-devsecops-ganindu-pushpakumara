@@ -1,5 +1,3 @@
-/** Domain errors. The error handler plugin owns the HTTP status mapping. */
-
 export class ValidationError extends Error {
   readonly reasons: string[];
 

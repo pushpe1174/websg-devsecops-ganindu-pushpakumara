@@ -1,9 +1,9 @@
 # Infrastructure
 
 ```
-Per-tenant DynamoDB stream -> EventBridge Pipe -> SQS FIFO -> Lambda -> that tenant's IPSet
-                        schedule (drift) ->  |
-                                             +-> DLQ -> alarm -> SNS
+API (SendMessage, group = tenantId) -> SQS FIFO -> Lambda -> that tenant's IPSet
+             schedule (drift, one message per tenant) ->  |
+                                                          +-> DLQ -> alarm -> SNS
 ```
 
 ```
@@ -14,24 +14,24 @@ terraform/
 ├── outputs.tf
 ├── prod.tfvars              the tenants, break-glass ranges and alert addresses
 └── modules/
-    ├── dynamodb/            one tenant's table + stream (called once per tenant)
+    ├── dynamodb/            the allowlist table (one, for every tenant)
     ├── waf_ip_sets/         one IPSet per tenant
-    ├── queue/               one Pipe per stream + FIFO queue + FIFO DLQ
+    ├── queue/               FIFO queue + FIFO DLQ + the drift-check schedule
     ├── lambda/              function + IAM + event source mapping
     └── monitoring/          SNS topic + CloudWatch alarms
 ```
 
-Every table is created in `main.tf` from the same `dynamodb` module, so there is one place
-that owns tables. A tenant's table and its IPSet share a name: `websg-cms-allowlist-<key>`.
+One table for the platform, `PK = tenantId` / `SK = ownerId`, so the worker reads a tenant
+with a `Query` on one partition. Each tenant's IPSet is `websg-cms-allowlist-<key>`.
 
-The state bucket is created by the Makefile at the repo root, not by Terraform — a
-bootstrap stack would need its own state, which is the problem it is trying to solve.
+The state bucket is created by the root Makefile, not Terraform — a bootstrap stack would
+need its own state, which is the problem it is trying to solve.
 
 ## Apply
 
-Day to day this runs in GitLab CI ([.gitlab-ci.yml](../.gitlab-ci.yml)): plan on every merge
-request, apply manually from `main`, credentials from GitLab OIDC. The pipeline applies the
-reviewed plan file, so what was approved is exactly what runs.
+Day to day this runs in GitLab CI ([.gitlab-ci.yml](../.gitlab-ci.yml)): plan on every MR,
+apply manually from `main`, credentials from GitLab OIDC. The pipeline applies the reviewed
+plan file, so what was approved is what runs.
 
 Locally, or for the first bootstrap:
 
@@ -42,43 +42,56 @@ make plan                      # runs `make package`, uses -var-file=prod.tfvars
 make apply
 ```
 
-`prod.tfvars` is committed — it holds no secrets and CI needs it. It is passed explicitly
-rather than auto-loaded, so a plan cannot pick up the wrong environment by accident.
+Before the first apply, edit `prod.tfvars` (real break-glass ranges, real alert addresses)
+and set `bucket` in the backend block of `providers.tf`.
 
-`make package` builds `lambda/build`, which `archive_file` zips at plan time. It runs
-automatically before plan and apply, because a stale package means Terraform sees no code
-change and silently deploys the old function.
+- `prod.tfvars` is committed — no secrets, and CI needs it. It is passed explicitly rather
+  than auto-loaded, so a plan cannot pick up the wrong environment by accident.
+- `make package` builds `lambda/build`, which `archive_file` zips at plan time. It runs
+  before plan and apply automatically, because a stale package means Terraform sees no code
+  change and silently deploys the old function.
+- Deploy-role permissions: [iam/terraform-deploy-policy.json](../iam/README.md). Creating the
+  state bucket is outside it — the pipeline should not reconfigure its own state.
 
-Before the first apply, edit `terraform/prod.tfvars` (real break-glass ranges, real alert
-addresses) and set `bucket` in the backend block of `providers.tf` to your bucket name.
+## Why a queue between the API and the function
 
-The deploy role's permissions are in [iam/terraform-deploy-policy.json](../iam/README.md).
-Creating the state bucket is deliberately outside that policy — the pipeline should not be
-able to reconfigure its own state.
+Not transport — the API could invoke the function directly. The queue is a **mutex**, and it
+buys three things:
 
-## Why a queue between the stream and the function
+- **One writer per IPSet.** `MessageGroupId` is the tenant on every producer, and Lambda
+  scales FIFO by group with one in-flight batch each. Two members of a tenant saving at once
+  reconcile in sequence; different tenants proceed in parallel.
+- **A real DLQ.** The failed *message* is parked, so redrive replays it in one API call.
+- **Retries decoupled from the request.** A failing reconcile is redelivered by SQS rather
+  than surfacing to a tenant whose write is already durable.
 
-DynamoDB Streams cannot target SQS directly, so an **EventBridge Pipe** does the hop. It is
-a managed integration — no forwarder function to write, deploy or monitor.
+There is deliberately **no DynamoDB stream and no EventBridge Pipe**. CDC earns its place
+when you do not control the writer; here the API is the only writer and knows the tenant id,
+so it calls `SendMessage` itself — removing a Pipe per tenant, its IAM role, and the filter
+that kept the worker's own acknowledgements from re-triggering it. The cost is that the write
+and the send are not atomic: the write is durable, the sweep bounds the gap at 15 minutes,
+and the tenant sees `PENDING` meanwhile.
 
-One Pipe per tenant stream, all targeting the same FIFO queue, which buys three things:
+### The sweep is grouped too
 
-- **Ordering where it matters.** The message group is the list owner (`ownerId`), and Lambda
-  scales FIFO by message group, so one user's edits stay ordered while everyone else
-  reconciles in parallel. Concurrent writers on one shared IPSet collide on the WAF lock
-  token and retry rather than losing an update.
-- **A real DLQ.** The failed *message* is parked, not a pointer to a stream position, so
-  SQS's start-message-move (redrive) API can replay it to the source queue in one call.
-- **Retries decoupled from the stream.** A failing batch is redelivered by SQS instead of
-  blocking a stream shard.
+The drift check emits **one message per tenant**, each in that tenant's group — `for_each`
+over the tenant ids on `aws_cloudwatch_event_target`, with a static `message_group_id` and
+`input` per target.
 
-The cost is one more hop and Pipe request charges. The reconciliation itself is a full
-rebuild, so the real win is the replayable DLQ and retries decoupled from the stream.
+This matters more than it looks: a sweep on its own group would be the one producer able to
+run *concurrently with* a tenant edit and collide on exactly the lock token the rest of the
+design protects.
+
+EventBridge has no dedup-id field on an SQS target, hence `content_based_deduplication = true`
+on the queue and an input transformer stamping the event time. The API does not rely on it —
+it sends an explicit `MessageDeduplicationId` of `tenant:owner:version`, which takes
+precedence: per logical edit, so a retry collapses while a genuine second edit is never
+swallowed by the 5-minute window.
 
 ## Onboarding a tenant
 
-One entry in `prod.tfvars`, then apply. (Until a real IdP is wired in, a new *user* also
-needs an entry in `backend/src/config/users.ts` — see
+One entry in `prod.tfvars`, then apply. (Until a real IdP is wired in, a new *user* also needs
+an entry in `backend/src/config/users.ts` — see
 [ARCHITECTURE.md](../ARCHITECTURE.md#scenario-10--onboarding-a-tenant).)
 
 ```hcl
@@ -89,154 +102,158 @@ tenants = {
 }
 ```
 
-Each key creates a table and an IPSet named `websg-cms-allowlist-<key>`, plus the Pipe that
-connects them. The worker reads the mapping from its `TENANTS` environment variable, so
-onboarding is **no code change** — a Terraform diff a reviewer can read.
+Each key creates an IPSet, a sweep target in that tenant's message group, and a stuck-sync
+alarm. The worker reads the mapping from `TENANTS`, so onboarding is **no code change** — a
+diff a reviewer can read. No new table: the tenant is a partition key in the existing one.
 
 | You want | Do this |
 | -------- | ------- |
-| Tenant gets its own table and IPSet | add a key |
-| Agencies share one IPSet | put them in one tenant key — separate items in that table, union applied |
+| Tenant gets its own IPSet | add a key |
+| Agencies share one IPSet | put them in one key — separate items in that partition, union applied |
 | Split a shared agency out later | add its own key and move its item |
 
-Isolation is structural: one table feeds exactly one IPSet, so a tenant's ranges cannot
-reach another tenant's IPSet even if the API were wrong.
+Isolation is structural: one partition feeds one IPSet, and the worker's `Query` is scoped to
+one `tenantId`, so a tenant's ranges cannot reach another's IPSet even if the API were wrong.
+
+A single table also gives the *canonical* IAM mechanism, should the API ever get per-tenant
+credentials: a `dynamodb:LeadingKeys` condition on the partition key. That is stronger than a
+per-table boundary, which a shared API role could never have enforced anyway.
 
 ## Keeping WAF in the application's hands
 
-Only the sync worker should ever change these IPSets. Three layers, because no single one
-is enough:
+Three layers, because no single one is enough:
 
-1. **`ignore_changes = [addresses]`** on every `aws_wafv2_ip_set`. Terraform owns the
-   resource, the application owns its contents. Without this, the next `terraform apply`
-   resets each IPSet to the empty address list in the resource and locks every tenant out
-   until the next sync.
-2. **The scheduled drift check** (`rate(15 minutes)` by default) puts a message on the same
-   FIFO queue. Because the worker rebuilds from the tables, anything changed in the console
-   is reverted on the next run — without it, drift on a quiet tenant survives until their
-   next edit, which could be never.
-3. **[deny-manual-ipset-edits.json](../iam/README.md)**, attached as an SCP or permissions
-   boundary, denies `wafv2:UpdateIPSet` to every principal except the worker's role and a
-   break-glass role. An explicit `Deny` beats any `Allow`, including an administrator's, so
-   the console edit fails outright instead of being silently undone 15 minutes later.
+| Layer | Does | Without it |
+| ----- | ---- | ---------- |
+| `ignore_changes = [addresses]` on every `aws_wafv2_ip_set` | Terraform owns the resource, the app owns its contents | the next `apply` resets each IPSet to the empty list and locks every tenant out until the next sync |
+| The drift check, `rate(15 minutes)` | rebuilds from the table, so console changes are undone | drift on a quiet tenant survives until their next edit, which could be never |
+| [deny-manual-ipset-edits.json](../iam/README.md) as an SCP | denies `wafv2:UpdateIPSet` to all but the worker and break-glass roles | a console edit succeeds and is only silently undone 15 minutes later |
 
-Layer 3 prevents it, layer 2 repairs it, layer 1 stops your own pipeline from causing it.
+Layer 3 prevents, layer 2 repairs, layer 1 stops your own pipeline from causing it. An
+explicit `Deny` beats any `Allow`, including an administrator's.
 
 ## What this owns
 
-**Owns:** each tenant's allowlist table and stream, the Pipes, the FIFO queue and its DLQ,
-the drift-check schedule, the Lambda and its role, the alarms and the SNS topic.
-
-**Owns, with a caveat:** the per-tenant IPSets — the resources, but never their
-`addresses`, which are ignored (see above).
-
-**Does not own:** the WebACL, the EKS clusters or the ALB. The WebACL rules that reference
-these IPSets live wherever the CMS WebACL is declared.
+- **Owns:** the allowlist table, the FIFO queue and DLQ, the drift schedule, the Lambda and
+  its role, the alarms and the SNS topic.
+- **Owns, with a caveat:** the per-tenant IPSets — the resources, never their `addresses`.
+- **Does not own:** the WebACL, the EKS clusters, the ALB. The rules referencing these IPSets
+  live wherever the CMS WebACL is declared.
 
 ## Concurrent triggers
 
-Ten users saving at the same moment produce ten stream records. Four things keep that from
-corrupting an IPSet:
+Ten users saving at once produce ten messages. Three things keep that from corrupting an
+IPSet:
 
-1. **Pipe batching** — records are gathered for up to 5 seconds, so a burst usually becomes
-   one message rather than ten.
-2. **FIFO message groups** — the group is the list owner, so one user's edits are delivered
-   one batch at a time and can never run against themselves, while different owners proceed
-   in parallel.
-3. **Full reconciliation** — the handler ignores message contents and rebuilds the IPSet
-   from a strongly consistent `Scan` of the whole table. Runs converge in any order,
-   because the operation is a rebuild rather than an increment. This is what makes two
-   agencies sharing a table safe: whoever runs second still writes the union.
-4. **WAF lock token** — `GetIPSet` returns a `LockToken` that `UpdateIPSet` must present.
-   Anything that changed in between causes `WAFOptimisticLockException`, so a concurrent
-   writer can never silently clobber; the message returns to the queue and is redelivered.
+1. **FIFO groups keyed by tenant** — one in-flight batch per tenant, so the ten arrive in a
+   few sequential batches with no second concurrent writer to any IPSet, while different
+   tenants proceed in parallel. This is the layer that makes collision *impossible* rather
+   than merely recoverable.
+2. **Full reconciliation** — the handler ignores message contents and rebuilds from a
+   strongly consistent `Query`. Runs converge in any order because it is a rebuild, not an
+   increment. This is what makes two agencies sharing a tenant safe: whoever runs second
+   still writes the union.
+3. **WAF lock token** — `GetIPSet` returns a token `UpdateIPSet` must present. With
+   per-tenant grouping this should never fire between two edits; it remains as the guard
+   against a console edit landing mid-update. The call fails, the message is redelivered, and
+   the retry reconciles from a fresh read.
 
-Layers 3 and 4 are what make it *correct*; 1 and 2 are what make it cheap. The `Scan` uses
-`ConsistentRead: true` deliberately — a default eventually consistent scan can miss the very
-write that triggered the run, publishing an IPSet that stays stale until the next edit.
+`ConsistentRead: true` is deliberate — an eventually consistent read can miss the very write
+that triggered the run, publishing an IPSet that stays stale until the next edit.
+
+### Partial batch failures
+
+The event source mapping sets `function_response_types = ["ReportBatchItemFailures"]`, and
+the handler returns the message ids of the tenants it could not reconcile instead of
+throwing. Without it, one tenant's WAF problem returns all ten messages and ticks nine healthy
+tenants toward the DLQ threshold on someone else's behalf.
 
 ## Confirming a change is live
 
-After a successful `UpdateIPSet` the worker writes `syncedVersion` and `syncedAt` back to
-each item it reconciled, and the API derives `syncStatus` from them — `APPLIED` when
-`syncedVersion == version`, `PENDING` otherwise.
+After a successful `UpdateIPSet` the worker writes `syncedVersion` and `syncedAt` back to each
+item it reconciled; the API derives `syncStatus` — `APPLIED` when `syncedVersion == version`,
+`PENDING` otherwise. A write holds the request open up to `SYNC_WAIT_MS` for that
+acknowledgement, so it normally answers **200 `APPLIED`**; if the window elapses, **202
+`PENDING`** and the portal polls.
 
-A write holds the request open for up to `SYNC_WAIT_MS` waiting for that acknowledgement, so
-it normally answers **200** with `syncStatus: APPLIED`. If the window elapses first it
-answers **202** with `PENDING` — stored and durable, not yet enforced — and the portal polls
-GET until it reads `APPLIED`.
+The status is derived, never stored, so it cannot drift. Two details make it trustworthy:
 
-The status is derived, never stored, so it cannot drift from the data. Two details make it
-trustworthy:
+- The acknowledgement is **conditional on the version the worker actually read**. A tenant who
+  saved again mid-sync fails that condition and correctly stays `PENDING` until their own
+  message is processed.
+- It runs after the WAF call *and* on the already-in-sync path — otherwise a retry following a
+  successful `UpdateIPSet` would leave the tenant `PENDING` forever.
 
-- The acknowledgement is **conditional on the version** the worker actually read. A tenant
-  who saved again mid-sync fails that condition and correctly stays `PENDING` until their
-  own message is processed.
-- It runs after the WAF call, and also on the already-in-sync path — otherwise a retry
-  following a successful `UpdateIPSet` would leave the tenant `PENDING` forever.
-
-### Why the acknowledgement does not re-trigger the worker
-
-The write-back lands on the same stream that triggers the worker, so it would loop. The
-Pipe filters it out:
-
-```json
-{ "dynamodb": { "NewImage": { "syncedVersion": { "N": [ { "exists": false } ] } } } }
-```
-
-The API replaces the whole item on every write, so a tenant edit never carries
-`syncedVersion`; the worker's `UpdateItem` is the only thing that sets it. "No
-`syncedVersion`" therefore means "tenant edit", and the acknowledgement never reaches the
-queue. Filtered records are skipped at the source — the stream iterator advances past them
-and nothing is billed downstream.
-
-`exists` only works on leaf nodes, which is why the pattern matches `syncedVersion.N` and
-not `syncedVersion`.
-
-This couples the filter to the repository writing with `PutItem` rather than merging with
-`UpdateItem`. If the API ever preserved `syncedVersion` on write, the worker would stop
-seeing tenant changes entirely — so that invariant is pinned by a test
-(`a write never carries the previous acknowledgement`) and commented at both ends.
+**The acknowledgement cannot re-trigger the worker.** Only the API sends to the queue, and
+only on a tenant write, so the worker's `UpdateItem` has nowhere to loop back to. That is one
+of the things dropping the stream bought: previously the acknowledgement landed on the same
+stream that triggered the worker, and a Pipe filter was needed to break the loop, coupling the
+whole sync path to the repository using `PutItem` rather than `UpdateItem`. The invariant
+still matters for a different reason — a write must not inherit the previous version's
+`syncedVersion` — so it stays pinned by the test `a write never carries the previous
+acknowledgement`. But getting it wrong is now one visible bug rather than a silent stall of
+the entire sync path.
 
 If a change never applies, the message ends on the DLQ and the tenant stays `PENDING` while
-the alarm fires — there is no `FAILED` state. Adding one means consuming the DLQ, which is
-worth doing only if the portal needs to distinguish "slow" from "stuck" on its own.
+the alarms fire — there is still no `FAILED` state on the API.
 
 ## Failure handling
 
-A failed run returns the batch to the queue. After `max_receive_count` (5) deliveries SQS
-moves the message to the FIFO DLQ, and the alarm fires.
+A failed reconcile returns *that tenant's* messages to the queue. After `max_receive_count`
+(5) deliveries SQS moves them to the FIFO DLQ and the alarm fires.
 
 | Alarm | Fires when | Means |
 | ----- | ---------- | ----- |
 | `…-dlq-not-empty` | any message on the DLQ | changes are **not** reaching WAF |
+| `…-sync-stuck-<tenant>` | that tenant's oldest unacknowledged edit is older than 5 min | edits are not going live, though nothing failed hard enough to be parked |
 | `…-errors` | function errors in 5 minutes | failing but still retrying — catch it before the DLQ |
 
-The DLQ alarm is the important one: nothing on the API side fails when sync stalls. Tenants
-keep saving successfully while their changes quietly stop reaching WAF, and `syncStatus` stays
-PENDING.
+Nothing on the API side fails when sync stalls: tenants keep saving successfully while their
+changes quietly stop reaching WAF. The alarms are the only signal, which is why there are
+three.
+
+### Slow or stuck
+
+The DLQ alarm needs five failures, so it says nothing about a sync that is merely not
+finishing. On every run the worker emits, per tenant, the age of its oldest unacknowledged
+edit at the moment it read the partition:
+
+```
+Namespace  WebSG/Allowlist
+Metric     OldestUnacknowledgedAgeSeconds
+Dimension  Tenant
+```
+
+A few seconds is healthy — just the gap between the write and the worker picking it up. A
+number climbing sweep after sweep is stuck.
+
+Emitted as **embedded metric format** on stdout, so it costs a log line and no
+`cloudwatch:PutMetricData`; emitted *before* reconciling, so a tenant whose sync keeps failing
+still reports rather than going blind exactly when the signal is needed. The alarm period
+matches the sweep interval, so there is one datapoint per tenant per sweep and `missing`
+genuinely means the worker never ran. Worst-case detection is two sweeps — a backstop for the
+DLQ alarm, not a first responder.
 
 ### Runbook: the DLQ alarm fired
 
 1. Inspect: `aws sqs receive-message --queue-url $(terraform -chdir=terraform output -raw dlq_url)`
-2. Check `/aws/lambda/websg-cms-allowlist-waf-sync` around that timestamp. Usual causes
-   are WAF throttling or the IPSet hitting its address limit.
-3. Fix the cause, then **redrive** — SQS replays the parked messages to the source queue:
-   ```bash
-   aws sqs start-message-move-task --source-arn <dlq-arn>
-   ```
-4. Often nothing needs replaying: the function rebuilds from a full table read, so a later
+2. Check `/aws/lambda/websg-cms-allowlist-waf-sync` around that timestamp. Usual causes are
+   WAF throttling or the IPSet hitting its address limit.
+3. Fix the cause, then redrive: `aws sqs start-message-move-task --source-arn <dlq-arn>`
+4. Often nothing needs replaying — the function rebuilds from a full read, so a later
    successful run already applied the parked change. Confirm the IPSet matches the table
    first, then purge instead.
-5. To force a sync without waiting for a tenant edit — the function ignores message
-   contents: `aws lambda invoke --function-name <name> --payload '{"Records":[]}' /dev/stdout`
+5. To force a sync without waiting for an edit (message contents are ignored):
+   `aws lambda invoke --function-name <name> --payload '{"Records":[]}' /dev/stdout`
 
 ## Notes
 
-- Terraform `>= 1.10` for `use_lockfile` state locking; the DynamoDB lock table approach is
-  deprecated.
-- The queue's visibility timeout (120s) must stay above the function timeout (60s), or a
-  slow run is redelivered while the first invocation is still working.
+- Terraform `>= 1.10` for `use_lockfile` state locking; the DynamoDB lock table is deprecated.
+- The queue's visibility timeout (120s) must stay above the function timeout (60s), or a slow
+  run is redelivered while the first invocation is still working.
 - No `node_modules` in the package — the nodejs24 runtime ships the AWS SDK v3.
-- The API pod's IAM role is **not** in this stack. Add a small IRSA role granting
-  `dynamodb:GetItem` and `PutItem` on `table_arn` when the pod is deployed.
+- The IPSets are `IPV4`, so `break_glass_cidrs` is validated as IPv4 — a v6 range would apply
+  cleanly and then fail every `UpdateIPSet` call. The API rejects IPv6 for the same reason.
+- The API pod's IAM role is **not** in this stack. Add an IRSA role granting
+  `dynamodb:GetItem` and `PutItem` on the table plus `sqs:SendMessage` on the queue when the
+  pod is deployed — see [iam/backend-api-policy.json](../iam/backend-api-policy.json).

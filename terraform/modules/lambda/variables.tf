@@ -13,12 +13,20 @@ variable "queue_arn" {
   type        = string
 }
 
+variable "table_name" {
+  description = "The allowlist table. Passed to the function as TABLE_NAME."
+  type        = string
+}
+
+variable "table_arn" {
+  description = "Allowlist table ARN, for scoping IAM."
+  type        = string
+}
+
 variable "tenants" {
-  description = "Tenant -> its table and IPSet. Passed to the function as TENANTS and used to scope IAM."
+  description = "Tenant -> its IPSet. Passed to the function as TENANTS and used to scope IAM."
 
   type = map(object({
-    tableName  = string
-    tableArn   = string
     ipSetId    = string
     ipSetName  = string
     ipSetArn   = string
@@ -30,6 +38,12 @@ variable "break_glass_cidrs" {
   description = "Ops ranges merged into every sync so an empty table cannot lock everyone out."
   type        = list(string)
   default     = []
+}
+
+variable "metric_namespace" {
+  description = "CloudWatch namespace for the embedded-metric-format metrics the worker emits."
+  type        = string
+  default     = "WebSG/Allowlist"
 }
 
 variable "timeout_seconds" {

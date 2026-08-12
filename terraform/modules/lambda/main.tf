@@ -2,13 +2,11 @@
 // Retries and the DLQ belong to the queue module.
 
 locals {
-  table_arns  = [for t in var.tenants : t.tableArn]
   ip_set_arns = distinct([for t in var.tenants : t.ipSetArn])
 
-  // Runtime config: which table feeds which IPSet.
+  // Runtime config: which IPSet belongs to which tenant.
   tenant_config = {
     for id, t in var.tenants : id => {
-      tableName  = t.tableName
       ipSetId    = t.ipSetId
       ipSetName  = t.ipSetName
       ipSetScope = t.ipSetScope
@@ -50,18 +48,19 @@ resource "aws_iam_role" "this" {
 }
 
 data "aws_iam_policy_document" "this" {
+  // Query, not Scan: one partition per tenant.
   statement {
-    sid       = "ReadAllTenantAllowlists"
-    actions   = ["dynamodb:Scan"]
-    resources = local.table_arns
+    sid       = "ReadTenantAllowlists"
+    actions   = ["dynamodb:Query"]
+    resources = [var.table_arn]
   }
 
-  // Records which version reached WAF, so the API can report APPLIED rather
-  // than guessing. Write access is limited to that acknowledgement.
+  // Only to record which version reached WAF, so the API reports APPLIED
+  // rather than guessing.
   statement {
     sid       = "AcknowledgeAppliedVersion"
     actions   = ["dynamodb:UpdateItem"]
-    resources = local.table_arns
+    resources = [var.table_arn]
   }
 
   statement {
@@ -81,6 +80,8 @@ data "aws_iam_policy_document" "this" {
     resources = local.ip_set_arns
   }
 
+  // The stuck-sync metric is embedded format on stdout, so this covers it -
+  // no cloudwatch:PutMetricData needed.
   statement {
     sid       = "WriteLogs"
     actions   = ["logs:CreateLogStream", "logs:PutLogEvents"]
@@ -118,8 +119,10 @@ resource "aws_lambda_function" "this" {
 
   environment {
     variables = {
+      TABLE_NAME        = var.table_name
       TENANTS           = jsonencode(local.tenant_config)
       BREAK_GLASS_CIDRS = join(",", var.break_glass_cidrs)
+      METRIC_NAMESPACE  = var.metric_namespace
     }
   }
 
@@ -134,7 +137,10 @@ resource "aws_lambda_event_source_mapping" "queue" {
   event_source_arn = var.queue_arn
   function_name    = aws_lambda_function.this.arn
 
-  // A batch is one reconciliation regardless of size: a failed run returns the
-  // whole batch to the queue, and the DLQ catches it after max_receive_count.
   batch_size = 10
+
+  // The handler returns the ids it could not process instead of throwing.
+  // Without this, one tenant's failure returns all ten messages and ticks nine
+  // healthy tenants toward the DLQ threshold.
+  function_response_types = ["ReportBatchItemFailures"]
 }

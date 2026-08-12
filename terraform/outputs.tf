@@ -1,17 +1,17 @@
-// The two values the API needs in its .env; everything else it derives.
-output "table_prefix" {
-  description = "Set as TABLE_PREFIX on the API. It resolves a tenant's table as <prefix>-<tenantId>."
-  value       = local.name
+// The three values the API needs in its .env; everything else it derives.
+output "table_name" {
+  description = "Set as TABLE_NAME on the API. One table for every tenant, partitioned by tenantId."
+  value       = module.allowlist.table_name
+}
+
+output "sync_queue_url" {
+  description = "Set as SYNC_QUEUE_URL on the API. It posts one message per write, grouped by tenant."
+  value       = module.queue.queue_url
 }
 
 output "region" {
   description = "Set as AWS_REGION on the API."
   value       = var.region
-}
-
-output "table_names" {
-  description = "Tenant -> allowlist table, for confirming what was created."
-  value       = { for id, table in module.allowlist : id => table.table_name }
 }
 
 output "ip_sets" {
@@ -22,11 +22,6 @@ output "ip_sets" {
 output "function_name" {
   description = "Sync function name, for logs and manual invokes."
   value       = module.lambda.function_name
-}
-
-output "queue_url" {
-  description = "FIFO queue feeding the sync function."
-  value       = module.queue.queue_url
 }
 
 output "dlq_url" {
