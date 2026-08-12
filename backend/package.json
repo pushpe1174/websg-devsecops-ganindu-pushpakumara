@@ -7,7 +7,7 @@
     "node": ">=24"
   },
   "scripts": {
-    "dev": "node --env-file-if-exists=.env --watch src/server.ts",
+    "dev": "node --env-file-if-exists=.env --watch --watch-path=src --watch-path=.env src/server.ts",
     "start": "node --env-file-if-exists=.env dist/server.js",
     "build": "rm -rf dist && tsc",
     "token": "node --env-file-if-exists=.env scripts/token.ts",

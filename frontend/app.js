@@ -1,4 +1,9 @@
-const API = localStorage.getItem('apiBase') ?? 'http://localhost:3000';
+const defaultApiBase = () =>
+  location.protocol.startsWith('http')
+    ? `${location.protocol}//${location.hostname}:3000`
+    : 'http://localhost:3000';
+
+const API = localStorage.getItem('apiBase') ?? defaultApiBase();
 
 const el = (id) => document.getElementById(id);
 const screens = { login: el('login'), app: el('app') };
@@ -198,7 +203,13 @@ async function call(method, path, body, ifMatch) {
       mode: 'cors',
     });
   } catch {
-    throw Object.assign(new Error(`Cannot reach the API at ${API}.`), { status: 0 });
+    throw Object.assign(
+      new Error(
+        `Cannot reach the API at ${API}.\n` +
+          `Check it is running, and that CORS_ORIGINS on the API includes ${location.origin}.`,
+      ),
+      { status: 0 },
+    );
   }
 
   const payload = await response.json().catch(() => ({}));

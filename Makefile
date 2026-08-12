@@ -8,6 +8,7 @@ TF_VARS      ?= -var-file=prod.tfvars
 .PHONY: help state-bucket package init plan apply destroy fmt validate test console frontend
 
 FRONTEND_PORT ?= 5173
+FRONTEND_HOST ?= localhost
 
 help: ## Show the available targets
 	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
@@ -60,8 +61,10 @@ validate: ## Validate the Terraform configuration
 	$(TF) validate
 
 frontend: ## Serve the self-service portal (needs the API running with CORS_ORIGINS matching)
-	@echo "Portal on http://localhost:$(FRONTEND_PORT) - API expected on http://localhost:3000"
-	python3 -m http.server $(FRONTEND_PORT) --directory frontend --bind 127.0.0.1
+	# The printed host and the bound address must match: the browser sends whichever
+	# one you open as the Origin, and the API only allows what is in CORS_ORIGINS.
+	@echo "Portal on http://$(FRONTEND_HOST):$(FRONTEND_PORT) - API expected on http://$(FRONTEND_HOST):3000"
+	python3 -m http.server $(FRONTEND_PORT) --directory frontend --bind $(FRONTEND_HOST)
 
 test: ## Run the backend and lambda test suites
 	cd backend && npm test

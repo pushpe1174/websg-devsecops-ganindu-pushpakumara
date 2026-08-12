@@ -15,14 +15,22 @@ styles.css   everything it looks like, light and dark
 make frontend        # http://localhost:5173, from the repo root
 ```
 
-It expects the API on `http://localhost:3000`. To point somewhere else, set it
-once in the browser console — no rebuild, no config file:
+It expects the API on port 3000 of whatever host serves the page — `localhost`
+and `127.0.0.1` both work. To point somewhere else, set it once in the browser
+console — no rebuild, no config file:
 
 ```js
 localStorage.setItem('apiBase', 'https://api.example');
 ```
 
-The API must list this origin in `CORS_ORIGINS`, which by default it does.
+The API must list the page's origin in `CORS_ORIGINS`, which by default it does
+for both `http://localhost:5173` and `http://127.0.0.1:5173`. Open the page over
+`make frontend`, not by double-clicking `index.html` — a `file://` page has the
+origin `null` and every request is blocked. When an origin is missing the
+browser rejects the request before it reaches the server, and the portal shows
+"Cannot reach the API" with no matching entry in the API log — the request never
+got there. Add the origin to `CORS_ORIGINS`; `npm run dev` watches `.env` and
+restarts itself, but `npm start` does not, so restart that one by hand.
 
 ## What it does
 
