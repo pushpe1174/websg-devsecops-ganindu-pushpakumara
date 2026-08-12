@@ -1,6 +1,6 @@
 import { isIPv4, isIPv6 } from 'node:net';
-import type { Config } from '../config/index.ts';
-import { ValidationError } from './errors.ts';
+import type { Config } from '../config.ts';
+import { validationError } from './errors.ts';
 
 type Policy = Config['policy'];
 
@@ -15,7 +15,7 @@ type Policy = Config['policy'];
  */
 export function normalizeAllowlist(entries: string[], policy: Policy): string[] {
   if (entries.length > policy.maxEntries) {
-    throw new ValidationError([`At most ${policy.maxEntries} entries are allowed`]);
+    throw validationError([`At most ${policy.maxEntries} entries are allowed`]);
   }
 
   const reasons: string[] = [];
@@ -23,15 +23,13 @@ export function normalizeAllowlist(entries: string[], policy: Policy): string[] 
 
   for (const raw of entries) {
     try {
-      const cidr = normalizeEntry(raw.trim(), policy);
-      if (seen.has(cidr)) continue;
-      seen.add(cidr);
+      seen.add(normalizeEntry(raw.trim(), policy));
     } catch (err) {
       reasons.push(`${JSON.stringify(raw)}: ${(err as Error).message}`);
     }
   }
 
-  if (reasons.length > 0) throw new ValidationError(reasons);
+  if (reasons.length > 0) throw validationError(reasons);
   return [...seen].sort();
 }
 

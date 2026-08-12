@@ -91,7 +91,7 @@ swallowed by the 5-minute window.
 ## Onboarding a tenant
 
 One entry in `prod.tfvars`, then apply. (Until a real IdP is wired in, a new *user* also needs
-an entry in `backend/src/config/users.ts` — see
+an entry in the `USERS` directory in `backend/src/config.ts` — see
 [ARCHITECTURE.md](../ARCHITECTURE.md#scenario-10--onboarding-a-tenant).)
 
 ```hcl

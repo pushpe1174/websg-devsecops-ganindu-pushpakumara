@@ -1,8 +1,7 @@
 import { buildApp } from './app.ts';
-import { assertConfig, config } from './config/index.ts';
-import { createVerifier } from './lib/jwt.ts';
-import { createSqsNotifier } from './modules/ip-allowlist/notifier.ts';
-import { createDynamoRepository } from './modules/ip-allowlist/repository.ts';
+import { createVerifier } from './infra/auth.ts';
+import { createDynamoRepository, createSqsNotifier } from './infra/aws.ts';
+import { assertConfig, config } from './config.ts';
 
 assertConfig(config);
 

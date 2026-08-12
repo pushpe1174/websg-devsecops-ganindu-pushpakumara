@@ -3,11 +3,10 @@
  *
  *   npm run token -- user-a
  *
- * The user must exist in src/config/users.ts; the tenant comes from there.
+ * The user must exist in the directory in src/config.ts; the tenant comes from there.
  */
 import { SignJWT } from 'jose';
-import { assertConfig, config } from '../src/config/index.ts';
-import { tenantOf } from '../src/config/users.ts';
+import { assertConfig, config, tenantOf } from '../src/config.ts';
 
 const [userId = 'user-a'] = process.argv.slice(2);
 

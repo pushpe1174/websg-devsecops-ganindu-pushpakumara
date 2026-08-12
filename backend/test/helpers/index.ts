@@ -1,10 +1,9 @@
 import { SignJWT } from 'jose';
+import type { Allowlist, AllowlistRepository, SyncNotifier, SyncSignal } from '../../src/core/allowlist.ts';
 import { buildApp } from '../../src/app.ts';
-import { config } from '../../src/config/index.ts';
-import { createVerifier } from '../../src/lib/jwt.ts';
-import { VersionConflictError } from '../../src/lib/errors.ts';
-import type { Allowlist, AllowlistRepository } from '../../src/modules/ip-allowlist/repository.ts';
-import type { SyncNotifier, SyncSignal } from '../../src/modules/ip-allowlist/notifier.ts';
+import { createVerifier } from '../../src/infra/auth.ts';
+import { config } from '../../src/config.ts';
+import { HttpError, versionConflict } from '../../src/core/errors.ts';
 
 export const testConfig = {
   ...config,
@@ -16,6 +15,10 @@ export const testConfig = {
 };
 
 const secret = new TextEncoder().encode(testConfig.jwt.secret);
+
+/** Asserts on the answer the caller gets, not on which class was thrown. */
+export const isStatus = (status: number) => (err: unknown) =>
+  err instanceof HttpError && err.status === status;
 
 export function signToken(userId: string) {
   return new SignJWT()
@@ -52,7 +55,7 @@ export function createMemoryRepository(seed: SeedItem[] = []): AllowlistReposito
     async put(tenantId, draft, expectedVersion) {
       const partition = partitionOf(tenantId);
       if ((partition.get(draft.ownerId)?.version ?? 0) !== expectedVersion) {
-        throw new VersionConflictError();
+        throw versionConflict();
       }
       const item: Allowlist = {
         ...draft,

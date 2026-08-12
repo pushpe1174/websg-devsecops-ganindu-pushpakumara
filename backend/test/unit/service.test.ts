@@ -1,9 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { ValidationError, VersionConflictError } from '../../src/lib/errors.ts';
-import type { Principal } from '../../src/lib/jwt.ts';
-import { createAllowlistService } from '../../src/modules/ip-allowlist/service.ts';
-import { createMemoryNotifier, createMemoryRepository, testConfig } from '../helpers/index.ts';
+import { createAllowlistService, type Principal } from '../../src/core/allowlist.ts';
+import { createMemoryNotifier, createMemoryRepository, isStatus, testConfig } from '../helpers/index.ts';
 
 const userA: Principal = { userId: 'user-a', tenantId: 'tenant-a' };
 
@@ -120,7 +118,7 @@ test('rejects an invalid list without writing anything', async () => {
   const service = buildService();
   await assert.rejects(
     service.replace({ principal: userA, cidrs: ['10.0.0.1'], expectedVersion: 0 }),
-    ValidationError,
+    isStatus(400),
   );
   assert.equal((await service.get(userA)).version, 0);
 });
@@ -170,7 +168,7 @@ test('does not signal when validation rejects the write', async () => {
 
   await assert.rejects(
     service.replace({ principal: userA, cidrs: ['10.0.0.1'], expectedVersion: 0 }),
-    ValidationError,
+    isStatus(400),
   );
   assert.deepEqual(notifier.sent, []);
 });
@@ -181,5 +179,5 @@ test('rejects a write against a stale version', async () => {
     service.replace({ principal: userA, cidrs: ['203.0.113.9'], expectedVersion: 0 });
 
   await write();
-  await assert.rejects(write(), VersionConflictError);
+  await assert.rejects(write(), isStatus(409));
 });

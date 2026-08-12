@@ -1,5 +1,19 @@
 const num = (value: string | undefined, fallback: number) => (value ? Number(value) : fallback);
 
+/**
+ * The tenant comes from here and never from the token, so a forged claim cannot
+ * reach another tenant's list. A user owns one list; users on one tenant share
+ * its IPSet as a union.
+ */
+export const USERS: Record<string, string> = {
+  'user-a': 'tenant-a',
+  'user-b': 'tenant-b',
+  'user-c': 'tenant-shared',
+  'user-d': 'tenant-shared',
+};
+
+export const tenantOf = (userId: string): string | undefined => USERS[userId];
+
 export const config = {
   port: num(process.env.PORT, 3000),
   host: process.env.HOST ?? '0.0.0.0',
@@ -19,7 +33,7 @@ export const config = {
   policy: {
     // Max CIDR entries per user. Keeps a tenant IPSet (10k hard limit) in bounds.
     maxEntries: num(process.env.MAX_ENTRIES, 50),
-    // Reject ranges broader than this prefix length. IPv4 only - see lib/cidr.ts.
+    // Reject ranges broader than this prefix length. IPv4 only - see cidr.ts.
     minPrefixV4: num(process.env.MIN_PREFIX_V4, 24),
   },
 
