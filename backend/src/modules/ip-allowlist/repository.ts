@@ -23,17 +23,20 @@ export interface AllowlistRepository {
   put(tenantId: string, draft: AllowlistDraft, expectedVersion: number): Promise<Allowlist>;
 }
 
-/** One table per tenant, named `<prefix>-<tenantId>` - the same name as its IPSet. */
-export function createDynamoRepository(tablePrefix: string): AllowlistRepository {
+/**
+ * One table for the whole platform: PK = tenantId, SK = ownerId. A tenant is a
+ * partition, so the sync worker reads one with a Query rather than scanning
+ * every item on the platform.
+ */
+export function createDynamoRepository(tableName: string): AllowlistRepository {
   const client = DynamoDBDocumentClient.from(new DynamoDBClient({}));
-  const tableOf = (tenantId: string) => `${tablePrefix}-${tenantId}`;
 
   return {
     async get(tenantId, ownerId) {
       const { Item } = await client.send(
         new GetCommand({
-          TableName: tableOf(tenantId),
-          Key: { ownerId },
+          TableName: tableName,
+          Key: { tenantId, ownerId },
           // The caller is polling for the worker's acknowledgement, so a stale
           // read would report PENDING on an already-applied list.
           ConsistentRead: true,
@@ -44,9 +47,9 @@ export function createDynamoRepository(tablePrefix: string): AllowlistRepository
 
     async put(tenantId, draft, expectedVersion) {
       // PutItem replaces the whole item, so `syncedVersion` is dropped and the
-      // new version starts unacknowledged. The Pipe filter relies on this: a
-      // record without `syncedVersion` is a user edit, one with it is the
-      // worker's own acknowledgement. Merging would hide edits from the worker.
+      // new version starts unacknowledged - which is the truth: this version has
+      // not reached WAF yet. Merging it forward would report a new edit as
+      // already live.
       const item: Allowlist = {
         ...draft,
         version: expectedVersion + 1,
@@ -58,8 +61,8 @@ export function createDynamoRepository(tablePrefix: string): AllowlistRepository
       try {
         await client.send(
           new PutCommand({
-            TableName: tableOf(tenantId),
-            Item: item,
+            TableName: tableName,
+            Item: { tenantId, ...item },
             ConditionExpression: isCreate ? 'attribute_not_exists(ownerId)' : '#v = :expected',
             ExpressionAttributeNames: isCreate ? undefined : { '#v': 'version' },
             ExpressionAttributeValues: isCreate ? undefined : { ':expected': expectedVersion },

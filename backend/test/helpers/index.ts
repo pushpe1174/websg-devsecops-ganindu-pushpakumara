@@ -4,9 +4,11 @@ import { config } from '../../src/config/index.ts';
 import { createVerifier } from '../../src/lib/jwt.ts';
 import { VersionConflictError } from '../../src/lib/errors.ts';
 import type { Allowlist, AllowlistRepository } from '../../src/modules/ip-allowlist/repository.ts';
+import type { SyncNotifier, SyncSignal } from '../../src/modules/ip-allowlist/notifier.ts';
 
 export const testConfig = {
   ...config,
+  aws: { ...config.aws, syncQueueUrl: 'https://sqs.test.local/queue.fifo' },
   jwt: { ...config.jwt, secret: 'test-secret-value-for-hs256-signing' },
   // Tests drive the acknowledgement themselves; no real worker to wait for.
   syncWaitMs: 0,
@@ -28,28 +30,28 @@ export function signToken(userId: string) {
 export type SeedItem = Allowlist & { tenantId: string };
 
 /**
- * In-memory stand-in for the per-tenant tables, with the same optimistic-locking
- * contract as DynamoDB. Keyed by table, so a write to one tenant cannot be read
- * from another.
+ * In-memory stand-in for the allowlist table, with the same optimistic-locking
+ * contract as DynamoDB. Keyed by tenant then owner, mirroring PK/SK, so a write
+ * to one tenant's partition cannot be read from another's.
  */
 export function createMemoryRepository(seed: SeedItem[] = []): AllowlistRepository {
-  const tables = new Map<string, Map<string, Allowlist>>();
+  const partitions = new Map<string, Map<string, Allowlist>>();
 
-  const tableOf = (tenantId: string) => {
-    const table = tables.get(tenantId) ?? new Map<string, Allowlist>();
-    tables.set(tenantId, table);
-    return table;
+  const partitionOf = (tenantId: string) => {
+    const partition = partitions.get(tenantId) ?? new Map<string, Allowlist>();
+    partitions.set(tenantId, partition);
+    return partition;
   };
 
-  for (const { tenantId, ...item } of seed) tableOf(tenantId).set(item.ownerId, item);
+  for (const { tenantId, ...item } of seed) partitionOf(tenantId).set(item.ownerId, item);
 
   return {
     async get(tenantId, ownerId) {
-      return tableOf(tenantId).get(ownerId) ?? null;
+      return partitionOf(tenantId).get(ownerId) ?? null;
     },
     async put(tenantId, draft, expectedVersion) {
-      const table = tableOf(tenantId);
-      if ((table.get(draft.ownerId)?.version ?? 0) !== expectedVersion) {
+      const partition = partitionOf(tenantId);
+      if ((partition.get(draft.ownerId)?.version ?? 0) !== expectedVersion) {
         throw new VersionConflictError();
       }
       const item: Allowlist = {
@@ -57,15 +59,34 @@ export function createMemoryRepository(seed: SeedItem[] = []): AllowlistReposito
         version: expectedVersion + 1,
         updatedAt: new Date().toISOString(),
       };
-      table.set(draft.ownerId, item);
+      partition.set(draft.ownerId, item);
       return item;
     },
   };
 }
 
-export function buildTestApp(repository: AllowlistRepository = createMemoryRepository()) {
+export type MemoryNotifier = SyncNotifier & { sent: SyncSignal[] };
+
+/** Records what the API would have put on the queue. */
+export function createMemoryNotifier(options: { fail?: boolean } = {}): MemoryNotifier {
+  const sent: SyncSignal[] = [];
+
+  return {
+    sent,
+    async notify(signal) {
+      if (options.fail) throw new Error('SQS unavailable');
+      sent.push(signal);
+    },
+  };
+}
+
+export function buildTestApp(
+  repository: AllowlistRepository = createMemoryRepository(),
+  notifier: SyncNotifier = createMemoryNotifier(),
+) {
   return buildApp({
     repository,
+    notifier,
     verify: createVerifier(testConfig),
     config: testConfig,
     logger: false,

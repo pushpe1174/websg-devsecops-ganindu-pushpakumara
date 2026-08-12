@@ -6,8 +6,10 @@ export const config = {
   logLevel: process.env.LOG_LEVEL ?? 'info',
 
   aws: {
-    // Each tenant has its own table: <prefix>-<tenantId>. Same name as its IPSet.
-    tablePrefix: process.env.TABLE_PREFIX ?? 'websg-cms-allowlist',
+    // One table for every tenant: PK = tenantId, SK = ownerId.
+    tableName: process.env.TABLE_NAME ?? 'websg-cms-allowlist',
+    // The API signals the sync worker itself; there is no change-capture hop.
+    syncQueueUrl: process.env.SYNC_QUEUE_URL,
   },
 
   // How long a write waits for the worker to confirm the list is live in WAF
@@ -18,9 +20,8 @@ export const config = {
   policy: {
     // Max CIDR entries per user. Keeps a tenant IPSet (10k hard limit) in bounds.
     maxEntries: num(process.env.MAX_ENTRIES, 50),
-    // Reject ranges broader than these prefix lengths.
+    // Reject ranges broader than this prefix length. IPv4 only - see lib/cidr.ts.
     minPrefixV4: num(process.env.MIN_PREFIX_V4, 24),
-    minPrefixV6: num(process.env.MIN_PREFIX_V6, 48),
   },
 
   jwt: {
@@ -35,4 +36,7 @@ export type Config = typeof config;
 /** Fails fast at boot rather than on the first request. */
 export function assertConfig(current: Config = config): void {
   if (!current.jwt.secret) throw new Error('Missing required configuration: JWT_SECRET');
+  // Without it a write is still durable, but nothing tells the worker until the
+  // 15-minute sweep - so treat a missing queue as misconfiguration, not a mode.
+  if (!current.aws.syncQueueUrl) throw new Error('Missing required configuration: SYNC_QUEUE_URL');
 }

@@ -1,6 +1,7 @@
 import type { Config } from '../../config/index.ts';
 import { normalizeAllowlist } from '../../lib/cidr.ts';
 import type { Principal } from '../../lib/jwt.ts';
+import type { SyncNotifier } from './notifier.ts';
 import type { Allowlist, AllowlistRepository } from './repository.ts';
 
 /**
@@ -20,11 +21,23 @@ export interface AllowlistService {
   }): Promise<AllowlistView>;
 }
 
+/** Just enough of a logger to record a lost signal; satisfied by Fastify's. */
+export type ServiceLogger = { error(context: object, message: string): void };
+
+export type ServiceDeps = {
+  repository: AllowlistRepository;
+  notifier: SyncNotifier;
+  config: Config;
+  logger?: ServiceLogger;
+};
+
 /** Business rules, free of HTTP concerns so they can be unit tested directly. */
-export function createAllowlistService(
-  repository: AllowlistRepository,
-  config: Config,
-): AllowlistService {
+export function createAllowlistService({
+  repository,
+  notifier,
+  config,
+  logger,
+}: ServiceDeps): AllowlistService {
   async function read({ userId, tenantId }: Principal): Promise<AllowlistView> {
     const record = await repository.get(tenantId, userId);
 
@@ -46,6 +59,23 @@ export function createAllowlistService(
         { ownerId: principal.userId, cidrs: normalized },
         expectedVersion,
       );
+
+      // The write and the signal are not atomic, and the write is the one that
+      // matters: it is durable, and the 15-minute sweep reconciles a tenant
+      // whose message never arrived. So a failed send is logged and answered
+      // PENDING rather than raised - the caller's edit is not lost, it is slow.
+      try {
+        await notifier.notify({
+          tenantId: principal.tenantId,
+          ownerId: principal.userId,
+          version: written.version,
+        });
+      } catch (err) {
+        logger?.error(
+          { err, tenant: principal.tenantId, owner: principal.userId, version: written.version },
+          'stored the allowlist but could not signal the sync worker; the sweep will pick it up',
+        );
+      }
 
       // Wait for the worker's acknowledgement so the caller gets a definitive
       // answer instead of having to poll. The write is durable regardless; if

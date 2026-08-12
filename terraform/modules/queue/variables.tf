@@ -1,11 +1,11 @@
 variable "name" {
-  description = "Base name for the pipe, the queue and its DLQ."
+  description = "Base name for the queue and its DLQ."
   type        = string
 }
 
-variable "stream_arns" {
-  description = "Tenant -> DynamoDB stream ARN. One pipe per stream, all feeding the same queue."
-  type        = map(string)
+variable "tenant_ids" {
+  description = "Tenant ids. The sweep emits one message per tenant, each in that tenant's message group."
+  type        = set(string)
 }
 
 variable "visibility_timeout_seconds" {

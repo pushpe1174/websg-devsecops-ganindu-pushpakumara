@@ -16,8 +16,8 @@ Notable restrictions:
 
 - **State access is prefix-scoped** to `websg-custom/*` in the state bucket, so this role
   cannot read or overwrite another product's state in the same bucket.
-- **`iam:PassRole` is conditioned** on `iam:PassedToService` being Lambda or Pipes. Without
-  that condition, permission to create a role plus permission to pass it anywhere is a
+- **`iam:PassRole` is conditioned** on `iam:PassedToService` being Lambda. Without that
+  condition, permission to create a role plus permission to pass it anywhere is a
   privilege-escalation path to any service.
 - **Role management is name-scoped** to `websg-cms-allowlist-*`, so it cannot touch
   unrelated roles.
@@ -80,13 +80,27 @@ allowlist is wrong, someone needs a way to edit WAF directly.
 
 ## `backend-api-policy.json`
 
-Everything the API can do: `dynamodb:GetItem` and `PutItem` on `websg-cms-allowlist-*`. It
-never touches WAF, SQS or the streams — it only records desired state, and the worker is the
-single writer to WAF.
+Everything the API can do:
 
-There is deliberately **no `Scan`**, so a leaked credential cannot dump every user's
-allowlist, and no `UpdateItem`: a write replaces the whole item, which is what keeps the
-worker's `syncedVersion` off tenant edits and lets the Pipe filter tell the two apart.
+- `dynamodb:GetItem` and `PutItem` on `websg-cms-allowlist` — the one allowlist table.
+- `sqs:SendMessage` on the sync queue, so it can signal the worker after a write.
+
+It never touches WAF. It records desired state and says "this tenant changed"; the worker is
+the single writer to WAF.
+
+There is deliberately **no `Query` and no `Scan`**. That matters more on a single table than
+it did on per-tenant tables: without it, a leaked credential could enumerate not just one
+tenant's allowlists but the whole platform's. The API only ever addresses one item by its
+full `{tenantId, ownerId}` key, so it does not need either.
+
+There is also no `UpdateItem`: a write replaces the whole item, which is what keeps the
+worker's `syncedVersion` off tenant edits — a new version has not reached WAF, so it must
+not inherit the previous one's acknowledgement.
+
+If the API ever gets per-tenant credentials, this is where a `dynamodb:LeadingKeys`
+condition on `${aws:PrincipalTag/tenantId}` would go. A single table makes that possible;
+the previous per-table wildcard (`websg-cms-allowlist-*`) granted every tenant's table to
+one role, so it was never enforcing the boundary it appeared to.
 
 Use it in two places: attached to the pod's IRSA role, and attached to the credentials used
 when running the backend locally (see [Running it](../README.md#running-it)).

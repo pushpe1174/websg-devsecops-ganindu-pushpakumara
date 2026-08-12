@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { buildTestApp, createMemoryRepository, signToken } from '../helpers/index.ts';
+import {
+  buildTestApp,
+  createMemoryNotifier,
+  createMemoryRepository,
+  signToken,
+} from '../helpers/index.ts';
 
 const PATH = '/v1/allowlist';
 
@@ -81,6 +86,28 @@ test('stores a normalised allowlist against the caller', async () => {
   assert.equal(res.json().ownerId, 'user-a');
   assert.equal(res.json().syncStatus, 'PENDING');
   assert.equal(res.headers.etag, '1');
+});
+
+test('a write signals the sync worker with the tenant resolved from the token', async () => {
+  const notifier = createMemoryNotifier();
+  const app = buildTestApp(createMemoryRepository(), notifier);
+
+  // user-c is in tenant-shared per the directory; the caller never supplies it.
+  await call('user-c', { method: 'PUT', ifMatch: '0', payload: { cidrs: ['203.0.113.9'] } }, app);
+
+  assert.deepEqual(notifier.sent, [
+    { tenantId: 'tenant-shared', ownerId: 'user-c', version: 1 },
+  ]);
+});
+
+test('a rejected write signals nothing', async () => {
+  const notifier = createMemoryNotifier();
+  const app = buildTestApp(createMemoryRepository(), notifier);
+
+  await call('user-a', { method: 'PUT', ifMatch: '0', payload: { cidrs: ['10.0.0.1'] } }, app);
+  await call('user-a', { method: 'PUT', payload: { cidrs: ['203.0.113.9'] } }, app); // no If-Match
+
+  assert.deepEqual(notifier.sent, []);
 });
 
 test('a user only ever writes its own list', async () => {

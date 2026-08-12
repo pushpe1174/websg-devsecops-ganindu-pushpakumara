@@ -28,7 +28,7 @@
           "Resource": "arn:aws:s3:::websg-custom-tfstate-273804046957/websg-custom/*"
       },
       {
-          "Sid": "AllowlistTables",
+          "Sid": "AllowlistTable",
           "Effect": "Allow",
           "Action": [
               "dynamodb:CreateTable",
@@ -43,7 +43,7 @@
               "dynamodb:UntagResource"
           ],
           "Resource": [
-              "arn:aws:dynamodb:ap-southeast-1:273804046957:table/websg-cms-allowlist-*"
+              "arn:aws:dynamodb:ap-southeast-1:273804046957:table/websg-cms-allowlist"
           ]
       },
       {
@@ -111,20 +111,6 @@
           ]
       },
       {
-          "Sid": "StreamToQueuePipe",
-          "Effect": "Allow",
-          "Action": [
-              "pipes:CreatePipe",
-              "pipes:DeletePipe",
-              "pipes:DescribePipe",
-              "pipes:UpdatePipe",
-              "pipes:ListTagsForResource",
-              "pipes:TagResource",
-              "pipes:UntagResource"
-          ],
-          "Resource": "arn:aws:pipes:ap-southeast-1:273804046957:pipe/websg-cms-allowlist-waf-sync-*"
-      },
-      {
           "Sid": "ExecutionRoles",
           "Effect": "Allow",
           "Action": [
@@ -150,10 +136,7 @@
           "Resource": "arn:aws:iam::273804046957:role/websg-cms-allowlist-*",
           "Condition": {
               "StringEquals": {
-                  "iam:PassedToService": [
-                      "lambda.amazonaws.com",
-                      "pipes.amazonaws.com"
-                  ]
+                  "iam:PassedToService": "lambda.amazonaws.com"
               }
           }
       },

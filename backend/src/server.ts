@@ -1,12 +1,15 @@
 import { buildApp } from './app.ts';
 import { assertConfig, config } from './config/index.ts';
 import { createVerifier } from './lib/jwt.ts';
+import { createSqsNotifier } from './modules/ip-allowlist/notifier.ts';
 import { createDynamoRepository } from './modules/ip-allowlist/repository.ts';
 
 assertConfig(config);
 
 const app = buildApp({
-  repository: createDynamoRepository(config.aws.tablePrefix),
+  repository: createDynamoRepository(config.aws.tableName),
+  // assertConfig has already established this is set.
+  notifier: createSqsNotifier(config.aws.syncQueueUrl!),
   verify: createVerifier(config),
   config,
 });

@@ -13,37 +13,41 @@ rejected input, manual WAF edits, sync failures and onboarding.
 
 ```
 [ Portal ] ──> [ Allowlist API ] ──1. save the user's IPs──> [ DynamoDB table ]
-                (Fastify, EKS)                                  │  one per tenant
-                                                                ▼ 2. change data capture
-                                                        [ DynamoDB Stream ]
-                                                                │
-                                                                ▼ 3. managed hop, no glue code
-                                                       [ EventBridge Pipe ]
-                                                                │
-                                                                ▼ 4. serialises + retries
-                                                        [ SQS FIFO queue ] ──> [ DLQ ]
-                                                                │
-                                                                ▼ 5. triggers worker
-                                                       [ WAF Sync Lambda ]
-                                                                │
-                                                                ▼ 6. reconciles state
-                                                          [ AWS WAF v2 ]
+                (Fastify, EKS)   │                              one table, PK tenantId
+                                 │                                        │
+                                 ▼ 2. signal, grouped by tenant           │
+                          [ SQS FIFO queue ] ──> [ DLQ ]                  │
+                                 │                                        │
+                                 ▼ 3. triggers worker                     │
+                          [ WAF Sync Lambda ] ──4. reads the partition────┘
+                                 │
+                                 ▼ 5. reconciles state
+                            [ AWS WAF v2 ]
 ```
 
-The API never calls WAF. It only owns the *desired state* in DynamoDB; the stream is the
-change-data-capture event and the Lambda is the single writer to WAF. That split gives:
+Two moving parts between the API and WAF. The API never calls WAF: it owns the *desired
+state* in DynamoDB, and the Lambda is the single writer to WAF. That split gives:
 
 - **Fast, safe writes** — the record is durable the moment it is stored. WAF throttling or a
   `WAFOptimisticLockException` never surfaces to a tenant.
 - **Idempotent reconciliation** — the Lambda ignores the message contents and rebuilds the
-  IPSet from a strongly consistent full table read. Retries, redeliveries and duplicate
-  events all converge to the same result, and a drifted IPSet self-heals.
-- **Serialised where it matters** — the FIFO queue groups by the list owner, so one user's
-  edits stay ordered while other tenants reconcile in parallel.
+  IPSet from a strongly consistent read of the tenant's partition. Retries, redeliveries and
+  duplicate events all converge to the same result, and a drifted IPSet self-heals.
+- **One writer per IPSet, structurally** — the FIFO message group is the **tenant**, and
+  FIFO allows one in-flight batch per group, so two members of a tenant editing at once
+  reconcile in sequence instead of racing on the WAF lock token. The scheduled sweep is
+  grouped the same way, so it queues behind edits rather than colliding with them.
 - **A replayable DLQ** — a permanently failed message is parked with its payload intact and
-  can be redriven back to the source queue with one API call.
+  can be redriven back to the source queue with one API call. One tenant's failure returns
+  only that tenant's messages, so healthy tenants are not dragged toward the DLQ with it.
 - **One writer, one audit trail** — every WAF change is attributable to a DynamoDB record
   with its `ownerId`, `version` and `updatedAt`.
+
+There is no DynamoDB stream and no EventBridge Pipe. Change-data-capture earns its place
+when you do not control the writer; here the API is the only writer and already knows the
+tenant id, so it sends the signal itself. The write and the send are not atomic — the write
+is the durable one, the 15-minute sweep bounds the gap, and it is visible as `PENDING`
+throughout.
 
 ## Layout
 
@@ -98,10 +102,10 @@ make plan             # builds the Lambda package first, uses -var-file=prod.tfv
 make apply
 ```
 
-This creates one DynamoDB table and one WAF IPSet per tenant (both named
-`websg-cms-allowlist-<tenant>`), the Pipes, the FIFO queue and DLQ, the sync Lambda, the
-drift-check schedule and the alarms. `make state-bucket` needs `s3:CreateBucket`, which is
-deliberately outside the deploy policy — run it once as an administrator.
+This creates the DynamoDB table (`websg-cms-allowlist`, shared by every tenant), one WAF
+IPSet per tenant (`websg-cms-allowlist-<tenant>`), the FIFO queue and DLQ, the sync Lambda,
+the drift-check schedule and the alarms. `make state-bucket` needs `s3:CreateBucket`, which
+is deliberately outside the deploy policy — run it once as an administrator.
 
 If you use your own state bucket, set `bucket` in the backend block of
 [terraform/providers.tf](terraform/providers.tf) and `STATE_BUCKET` in the
@@ -116,18 +120,19 @@ npm install
 cp .env.example .env
 ```
 
-Then read the two values the API needs out of Terraform and put them in `.env`:
+Then read the three values the API needs out of Terraform and put them in `.env`:
 
 ```bash
-terraform -chdir=../terraform output -raw table_prefix   # → TABLE_PREFIX
-terraform -chdir=../terraform output -raw region         # → AWS_REGION
+terraform -chdir=../terraform output -raw table_name       # → TABLE_NAME
+terraform -chdir=../terraform output -raw sync_queue_url    # → SYNC_QUEUE_URL
+terraform -chdir=../terraform output -raw region            # → AWS_REGION
 ```
 
 Also set `JWT_SECRET` to any non-empty string — it signs and verifies the local access
 tokens, and the API refuses to boot without it. Set `AWS_PROFILE` if the credentials you
 want are not in your default profile; the SDK reads `~/.aws/credentials`, so never put keys
 in `.env`. Those credentials need [iam/backend-api-policy.json](iam/backend-api-policy.json)
-(`GetItem` + `PutItem` on `websg-cms-allowlist-*`).
+(`GetItem` + `PutItem` on the table, `SendMessage` on the queue).
 
 Everything else in `.env.example` has a working default.
 
@@ -293,22 +298,26 @@ rather than duplicated in application code.
    thing runs and tests without one; swapping in JWKS verification is a change to
    [jwt.ts](backend/src/lib/jwt.ts) alone.
 2. **A user owns one list; a tenant owns one IPSet.** Agencies that must share an IPSet
-   share a tenant key and are separate items in that tenant's table — the worker applies the
-   union. Agencies that must be isolated get their own tenant key. Shared and per-tenant are
-   one code path, not two modes.
+   share a tenant key and are separate items in that tenant's partition — the worker applies
+   the union. Agencies that must be isolated get their own tenant key. Shared and per-tenant
+   are one code path, not two modes.
 3. **Terraform owns the IPSet resource; the application owns its addresses.**
    `ignore_changes = [addresses]` is what makes that safe — without it the next
    `terraform apply` empties every IPSet and locks tenants out until the next sync.
 4. **Eventual consistency is acceptable, and visible.** Propagation takes seconds. The
    response says `APPLIED` or `PENDING` rather than implying enforcement it cannot confirm.
-5. **Scale is small.** Tens to low hundreds of tenants, so the worker's full-table `Scan` is
-   cheaper and simpler than incremental merging, and stays far inside the 10,000-address WAF
-   IPSet limit (50 entries × 200 users).
+5. **Rebuild beats merge.** The worker re-reads a tenant's whole partition rather than
+   applying deltas — simpler, idempotent, and bounded by that tenant's member count rather
+   than by the size of the platform, so this does not depend on the platform staying small.
+   A tenant stays far inside the 10,000-address WAF IPSet limit (50 entries × 200 users).
 6. **Full-list replacement, not add/remove.** Matches how the portal UI edits a list, and
    removes the ambiguity of concurrent partial edits.
 7. **Tenants may only submit public, routable ranges.** Allowlisting RFC1918 space on an
    internet-facing WAF is meaningless at best and misleading at worst, so it is rejected at
    the edge rather than silently ignored by WAF.
+8. **IPv4 only.** WAF IPSets are single-family and these are `IPV4`, so the API rejects IPv6
+   with a 400 that says so. Accepting an address family the infrastructure cannot hold would
+   mean storing a range that reports `PENDING` and never goes live.
 
 ## Infrastructure
 
@@ -323,15 +332,16 @@ keys. The apply consumes the reviewed plan file, so what was approved is what ru
 
 | Module | Creates |
 | ------ | ------- |
-| `modules/dynamodb` | one tenant's table — `ownerId` key, PITR, SSE, **stream** (`NEW_IMAGE`) |
-| `modules/waf_ip_sets` | one **WAF IPSet** per tenant, addresses ignored |
-| `modules/queue` | one **EventBridge Pipe** per stream, the **SQS FIFO queue**, its **DLQ**, the drift-check schedule |
+| `modules/dynamodb` | the allowlist table — `PK tenantId` / `SK ownerId`, PITR, SSE |
+| `modules/waf_ip_sets` | one **WAF IPSet** per tenant, `IPV4`, addresses ignored |
+| `modules/queue` | the **SQS FIFO queue**, its **DLQ**, and the per-tenant drift-check schedule |
 | `modules/lambda` | the function, its least-privilege role, the event source mapping |
 | `modules/monitoring` | SNS topic and the **CloudWatch alarms** |
 
 **Onboarding a tenant is one entry in `prod.tfvars`** — no code change, no redeploy. The
-worker reads the tenant → table → IPSet mapping from its `TENANTS` environment variable,
-which Terraform renders.
+worker reads the tenant → IPSet mapping from its `TENANTS` environment variable, which
+Terraform renders. There is no new table to create: the tenant is a partition key in the
+existing one.
 
 **Only the application writes IPSet addresses**, enforced in three layers:
 `ignore_changes = [addresses]` stops Terraform reverting the app; a scheduled drift check
@@ -350,22 +360,29 @@ create-a-role plus pass-it-anywhere is a privilege-escalation path; and creating
 bucket is deliberately outside the deploy policy, so the pipeline cannot reconfigure its own
 state.
 
-The backend gets exactly `dynamodb:GetItem` and `PutItem` — no `Scan`, so a leaked local
-credential cannot dump every user's allowlist. The same policy covers the pod's IRSA role
-and local development.
+The backend gets exactly `dynamodb:GetItem` and `PutItem` on the one table, plus
+`sqs:SendMessage` on the queue. **No `Query` and no `Scan`**, so a leaked credential cannot
+dump another user's allowlist — or, on a single table, the whole platform's. The same policy
+covers the pod's IRSA role and local development.
 
-Failure handling is the part worth reading. A failed run returns the batch to the queue;
-after 5 deliveries SQS parks the message on the FIFO DLQ and the alarm fires. Any message
-there matters, because **nothing on the API side fails when sync stalls** — tenants keep
-getting successful writes and `syncStatus` simply stays `PENDING`. Recovery is a redrive
-(`aws sqs start-message-move-task`), not a manual replay.
+Failure handling is the part worth reading. A failed reconcile returns **only that tenant's
+messages** to the queue (`ReportBatchItemFailures`); after 5 deliveries SQS parks them on the
+FIFO DLQ and the alarm fires. Any message there matters, because **nothing on the API side
+fails when sync stalls** — tenants keep getting successful writes and `syncStatus` simply
+stays `PENDING`. Recovery is a redrive (`aws sqs start-message-move-task`), not a manual
+replay.
+
+The DLQ alarm only fires after five failures, so it says nothing about a sync that is merely
+not finishing. For that the worker emits `OldestUnacknowledgedAgeSeconds` per tenant as
+embedded metric format, and a `sync-stuck-<tenant>` alarm fires above 5 minutes — enough to
+tell *slow* from *stuck* without consuming the DLQ.
 
 ## Bonus
 
 ### Tenant-specific IP allowlists — implemented
 
 This is built, not just proposed: `modules/waf_ip_sets` creates an IPSet per tenant and the
-worker reconciles each from that tenant's own table. What remains is the WAF rule side,
+worker reconciles each from that tenant's own partition. What remains is the WAF rule side,
 which lives with the CMS WebACL:
 
 1. One rule per tenant: `Host == <tenant>.cms.websg.gov.sg AND NOT ip in <tenant IPSet>` →
