@@ -1,0 +1,29 @@
+{
+  "name": "websg-ip-allowlist-api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "node --env-file-if-exists=.env --watch --watch-path=src --watch-path=.env src/server.ts",
+    "start": "node --env-file-if-exists=.env dist/server.js",
+    "build": "rm -rf dist && tsc",
+    "token": "node --env-file-if-exists=.env scripts/token.ts",
+    "typecheck": "tsc -p tsconfig.test.json",
+    "test": "node --test \"test/**/*.test.ts\""
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.700.0",
+    "@aws-sdk/client-sqs": "^3.700.0",
+    "@aws-sdk/lib-dynamodb": "^3.700.0",
+    "@fastify/cors": "^11.3.0",
+    "fastify": "^5.2.0",
+    "jose": "^5.9.6"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.7.2"
+  }
+}

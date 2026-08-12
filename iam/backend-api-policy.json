@@ -1,0 +1,23 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadWriteTenantAllowlists",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:GetItem",
+        "dynamodb:PutItem"
+      ],
+      "Resource": "arn:aws:dynamodb:ap-southeast-1:273804046957:table/websg-cms-allowlist"
+    },
+    {
+      "Sid": "SignalSyncWorker",
+      "Effect": "Allow",
+      "Action": [
+        "sqs:SendMessage",
+        "sqs:GetQueueUrl"
+      ],
+      "Resource": "arn:aws:sqs:ap-southeast-1:273804046957:websg-cms-allowlist-waf-sync.fifo"
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+node_modules/
+dist/
+.env
+.DS_Store
+
+build/
+.build/
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+# Environment tfvars are committed - they hold no secrets and CI needs them.
+!prod.tfvars
+*.auto.tfvars
+
+# .terraform.lock.hcl is deliberately NOT ignored - it pins provider checksums
+# and must be committed so every apply resolves identical providers.
