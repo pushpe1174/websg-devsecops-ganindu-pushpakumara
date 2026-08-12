@@ -7,9 +7,6 @@ export type Allowlist = {
   cidrs: string[];
   version: number;
   updatedAt: string;
-
-  // Written by the worker once this version is live in WAF; absent until then,
-  // which makes a new write PENDING by construction rather than by a flag.
   syncedVersion?: number;
   syncedAt?: string;
 };
@@ -18,7 +15,6 @@ export type AllowlistDraft = { ownerId: string; cidrs: string[] };
 
 export interface AllowlistRepository {
   get(tenantId: string, ownerId: string): Promise<Allowlist | null>;
-  /** Writes only if the stored version still matches `expectedVersion` (0 = create). */
   put(tenantId: string, draft: AllowlistDraft, expectedVersion: number): Promise<Allowlist>;
 }
 
@@ -35,8 +31,6 @@ export function createDynamoRepository(tableName: string): AllowlistRepository {
         new GetCommand({
           TableName: tableName,
           Key: { tenantId, ownerId },
-          // The caller polls for the acknowledgement, so a stale read would
-          // report PENDING on an already-applied list.
           ConsistentRead: true,
         }),
       );
@@ -44,9 +38,6 @@ export function createDynamoRepository(tableName: string): AllowlistRepository {
     },
 
     async put(tenantId, draft, expectedVersion) {
-      // PutItem replaces the item, dropping `syncedVersion` so the new version
-      // starts unacknowledged - which is true, it has not reached WAF. Carrying
-      // it forward would report a fresh edit as already live.
       const item: Allowlist = {
         ...draft,
         version: expectedVersion + 1,

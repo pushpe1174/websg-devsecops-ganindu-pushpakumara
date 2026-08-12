@@ -8,7 +8,6 @@ assertConfig(config);
 
 const app = buildApp({
   repository: createDynamoRepository(config.aws.tableName),
-  // assertConfig has already established this is set.
   notifier: createSqsNotifier(config.aws.syncQueueUrl!),
   verify: createVerifier(config),
   config,

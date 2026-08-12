@@ -32,10 +32,7 @@ export const config = {
 
 export type Config = typeof config;
 
-/** Fails fast at boot rather than on the first request. */
 export function assertConfig(current: Config = config): void {
   if (!current.jwt.secret) throw new Error('Missing required configuration: JWT_SECRET');
-  // A write stays durable without it, but nothing tells the worker until the
-  // 15-minute sweep - so a missing queue is misconfiguration, not a mode.
   if (!current.aws.syncQueueUrl) throw new Error('Missing required configuration: SYNC_QUEUE_URL');
 }

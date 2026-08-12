@@ -18,7 +18,6 @@ export function createVerifier(config: Config): TokenVerifier {
     const { payload } = await jwtVerify(token, secret, {
       issuer: config.jwt.issuer,
       audience: config.jwt.audience,
-      // Fixed algorithm - never trust the token header's `alg`.
       algorithms: ['HS256'],
     });
 

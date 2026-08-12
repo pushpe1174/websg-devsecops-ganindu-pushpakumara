@@ -18,7 +18,6 @@ export interface AllowlistService {
   }): Promise<AllowlistView>;
 }
 
-/** Just enough of a logger to record a lost signal; satisfied by Fastify's. */
 export type ServiceLogger = { error(context: object, message: string): void };
 
 export type ServiceDeps = {
@@ -28,7 +27,6 @@ export type ServiceDeps = {
   logger?: ServiceLogger;
 };
 
-/** Business rules, free of HTTP so they unit test directly. */
 export function createAllowlistService({
   repository,
   notifier,
@@ -37,8 +35,6 @@ export function createAllowlistService({
 }: ServiceDeps): AllowlistService {
   async function read({ userId, tenantId }: Principal): Promise<AllowlistView> {
     const record = await repository.get(tenantId, userId);
-
-    // A never-configured user has nothing outstanding, so nothing pending.
     return view(
       tenantId,
       record ?? { ownerId: userId, cidrs: [], version: 0, updatedAt: '', syncedVersion: 0 },
@@ -56,10 +52,6 @@ export function createAllowlistService({
         expectedVersion,
       );
 
-      // The write and the signal are not atomic, and the write is the durable
-      // one: the 15-minute sweep reconciles a tenant whose message never
-      // arrived. So a failed send is logged, not raised - the edit is slow,
-      // not lost.
       try {
         await notifier.notify({
           tenantId: principal.tenantId,

@@ -7,11 +7,6 @@ declare module 'fastify' {
   }
 }
 
-/**
- * Authenticates every request in the scope it is registered on, so public routes
- * (health) stay outside it. No tenant appears in any path: a caller only ever
- * addresses its own list, making cross-tenant access impossible, not rejected.
- */
 export function registerAuthentication(app: FastifyInstance, verify: TokenVerifier): void {
   app.addHook('onRequest', async (request, reply) => {
     const header = request.headers.authorization ?? '';

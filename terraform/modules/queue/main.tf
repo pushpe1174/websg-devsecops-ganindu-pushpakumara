@@ -1,10 +1,3 @@
-// SQS FIFO between the API and the reconciler. A mutex, not transport:
-// MessageGroupId is the tenant on every producer, and FIFO allows one in-flight
-// batch per group, so no IPSet ever has two concurrent writers.
-//
-// The message carries no data - the worker rebuilds from the table - so
-// duplication, reordering and redelivery are harmless.
-
 resource "aws_sqs_queue" "dlq" {
   name       = "${var.name}-dlq.fifo"
   fifo_queue = true
@@ -18,15 +11,7 @@ resource "aws_sqs_queue" "dlq" {
 resource "aws_sqs_queue" "main" {
   name       = "${var.name}.fifo"
   fifo_queue = true
-
-  // For the sweep only: EventBridge has no dedup-id field on an SQS target, and
-  // the input transformer stamps the event time to keep each check distinct.
-  // The API overrides it with tenant:owner:version, which is per logical edit -
-  // a retry collapses, a genuine second edit is never swallowed.
   content_based_deduplication = true
-
-  // Must exceed the function timeout, or a slow run is redelivered while the
-  // first invocation is still working.
   visibility_timeout_seconds = var.visibility_timeout_seconds
   message_retention_seconds  = 345600 # 4 days
   sqs_managed_sse_enabled    = true
@@ -39,12 +24,6 @@ resource "aws_sqs_queue" "main" {
   tags = var.tags
 }
 
-// ------------------------------------------------------------ Drift check
-//
-// Two jobs: revert console edits to an IPSet, which would otherwise survive
-// until the tenant's next write; and bound the cost of a lost signal, since the
-// DynamoDB write and the SQS send are not atomic.
-
 resource "aws_cloudwatch_event_rule" "drift_check" {
   name                = "${var.name}-drift-check"
   description         = "Periodic reconciliation, reverts IPSet edits made outside the application"
@@ -53,9 +32,6 @@ resource "aws_cloudwatch_event_rule" "drift_check" {
   tags = var.tags
 }
 
-// One target per tenant, in that tenant's message group, so a sweep queues
-// behind its edits. Without this the sweep would be the one producer able to
-// collide on the lock token everything else is arranged to protect.
 resource "aws_cloudwatch_event_target" "drift_check" {
   for_each = var.tenant_ids
 
