@@ -1,410 +1,348 @@
 # WebSG Custom — CMS IP Allowlist Self-Service API
 
-Backend for the tenant self-service portal: tenants submit the list of IP addresses that
-may reach their CMS, and the platform applies that list to their AWS WAF IPSet without a
-service request.
+Tenants submit the IP addresses that may reach their CMS, and the platform applies that list
+to their AWS WAF IPSet — no service request, no ticket.
 
-**[ARCHITECTURE.md](ARCHITECTURE.md)** walks the whole system and gives a runnable `curl`
-for every scenario it handles — shared IPSets, per-tenant IPSets, concurrent edits,
-rejected input, manual WAF edits, sync failures and onboarding.
-**[TESTING.md](TESTING.md)** maps the test suites to those behaviours.
+- **[ARCHITECTURE.md](ARCHITECTURE.md)** — a runnable `curl` per scenario.
+- **[TESTING.md](TESTING.md)** — which test holds up which behaviour.
+- **[terraform/README.md](terraform/README.md)** — infrastructure notes and the DLQ runbook.
 
-## Approach
+## The architecture
 
 ```
-[ Portal ] ──> [ Allowlist API ] ──1. save the user's IPs──> [ DynamoDB table ]
-                (Fastify, EKS)   │                              one table, PK tenantId
-                                 │                                        │
-                                 ▼ 2. signal, grouped by tenant           │
-                          [ SQS FIFO queue ] ──> [ DLQ ]                  │
-                                 │                                        │
-                                 ▼ 3. triggers worker                     │
-                          [ WAF Sync Lambda ] ──4. reads the partition────┘
-                                 │
-                                 ▼ 5. reconciles state
-                            [ AWS WAF v2 ]
+                    ┌───────────────────────────────────────────┐
+  portal user ─PUT─►│  Allowlist API   (Fastify, pod on EKS)    │
+                    │  authenticate · validate · store          │
+                    └────┬─────────────────────────┬────────────┘
+     1. PutItem          │                         │  2. SendMessage
+        (conditional     ▼                         │     group = tenantId
+         on version) ┌─────────────────────┐       │
+                     │  DynamoDB           │       │
+                     │  websg-cms-allowlist│       │
+                     │  PK tenantId        │       │
+                     │  SK ownerId         │       │
+                     └─────────────────────┘       │
+                              ▲                    ▼
+   sweep, every 15 min ───────┼──────────►  ┌────────────┐    ┌──────┐
+   one message per tenant     │             │  SQS FIFO  │───►│ DLQ  │─► alarm ─► SNS
+                              │             └─────┬──────┘    └──────┘
+                    ┌─────────┴──────────────────────────────────┐
+                    │  WAF Sync Lambda                           │
+                    │  3. Query the partition (consistent)       │
+                    │  4. UpdateIPSet · write syncedVersion back │
+                    └──────┬──────────────────────┬──────────────┘
+                           ▼                      ▼
+                   ┌──────────────┐      ┌──────────────┐
+                   │ IPSet        │      │ IPSet        │
+                   │ tenant-a     │      │ tenant-shared│
+                   │ (A)          │      │ (C ∪ D)      │
+                   └──────────────┘      └──────────────┘
 ```
 
-Two moving parts between the API and WAF. The API never calls WAF: it owns the *desired
-state* in DynamoDB, and the Lambda is the single writer to WAF. That split gives:
+**The API never calls WAF.** It owns *desired state* in DynamoDB; the Lambda is the single
+writer to WAF. Everything below follows from that split.
 
-- **Fast, safe writes** — the record is durable the moment it is stored. WAF throttling or a
-  `WAFOptimisticLockException` never surfaces to a tenant.
-- **Idempotent reconciliation** — the Lambda ignores the message contents and rebuilds the
-  IPSet from a strongly consistent read of the tenant's partition. Retries, redeliveries and
-  duplicate events all converge to the same result, and a drifted IPSet self-heals.
-- **One writer per IPSet, structurally** — the FIFO message group is the **tenant**, and
-  FIFO allows one in-flight batch per group, so two members of a tenant editing at once
-  reconcile in sequence instead of racing on the WAF lock token. The scheduled sweep is
-  grouped the same way, so it queues behind edits rather than colliding with them.
-- **A replayable DLQ** — a permanently failed message is parked with its payload intact and
-  can be redriven back to the source queue with one API call. One tenant's failure returns
-  only that tenant's messages, so healthy tenants are not dragged toward the DLQ with it.
-- **One writer, one audit trail** — every WAF change is attributable to a DynamoDB record
-  with its `ownerId`, `version` and `updatedAt`.
+## How it works
 
-There is no DynamoDB stream and no EventBridge Pipe. Change-data-capture earns its place
-when you do not control the writer; here the API is the only writer and already knows the
-tenant id, so it sends the signal itself. The write and the send are not atomic — the write
-is the durable one, the 15-minute sweep bounds the gap, and it is visible as `PENDING`
-throughout.
+| # | Step | Where |
+| - | ---- | ----- |
+| 1 | `PutItem`, conditional on `version`. **Durable here** — nothing in WAF yet | [repository.ts](backend/src/modules/ip-allowlist/repository.ts) |
+| 2 | `SendMessage` with `MessageGroupId = tenantId`. The body is a signal, carrying no list data | [notifier.ts](backend/src/modules/ip-allowlist/notifier.ts) |
+| 3 | Lambda `Query`s that one partition with `ConsistentRead`, unions every member's cidrs with the break-glass ranges | [index.ts](lambda/src/index.ts) |
+| 4 | `UpdateIPSet`, then `syncedVersion` written back onto the item | [index.ts](lambda/src/index.ts) |
+| 5 | The still-open request sees `syncedVersion == version` → **200 `APPLIED`**. If `SYNC_WAIT_MS` (15s) elapses first → **202 `PENDING`** | [service.ts](backend/src/modules/ip-allowlist/service.ts) |
 
-## Layout
+The 15 seconds is a *wait budget*, not a delay: the caller normally gets a definitive `200`
+in the same request rather than polling. The whole path takes seconds.
 
-```
-backend/                        Fastify + TypeScript API (pod on the CMS EKS cluster)
-├── src/
-│   ├── config/                 env loading, policy limits, the user directory
-│   ├── lib/                    framework-free logic: cidr validation, jwt, domain errors
-│   ├── plugins/                cross-cutting Fastify wiring: auth, error mapping
-│   ├── routes/                 health probes
-│   ├── modules/ip-allowlist/   the feature: routes → service → repository + schemas
-│   ├── app.ts                  composition root (dependencies injected, no globals)
-│   └── server.ts               process concerns: listen, signals, shutdown
-├── test/
-│   ├── unit/                   pure logic and the service layer
-│   ├── integration/            HTTP through the real app via fastify.inject
-│   └── helpers/                token signing, in-memory repository, app factory
-├── Dockerfile                  multi-stage, non-root, prod deps only
-└── .env.example
+## The pieces
 
-lambda/                         SQS → WAF v2 sync worker
-terraform/                      main.tf + prod.tfvars + five modules
-iam/                            least-privilege policies (deploy role, backend, SCP)
-Makefile                        state bucket, package, plan/apply, tests
-.gitlab-ci.yml                  terraform plan on MR, manual apply from main
+### DynamoDB — the desired state
+
+One table, `websg-cms-allowlist`, one item per user:
+
+```json
+{ "tenantId": "tenant-a",   "ownerId": "user-a",
+  "cidrs": ["198.51.100.0/24", "203.0.113.9/32"],
+  "version": 3,  "updatedAt": "2026-08-11T09:12:00.000Z",
+  "syncedVersion": 3, "syncedAt": "2026-08-11T09:12:04.000Z" }
 ```
 
-The layering rule is one-directional: `routes` (HTTP) → `service` (business rules) →
-`repository` (AWS). `lib/` knows nothing about Fastify or the AWS SDK, which is why the
-validation and service tests need no mocks beyond an in-memory repository. `app.ts` takes
-its dependencies as arguments, so tests build the same app the pod runs.
+| Field | Does |
+| ----- | ---- |
+| `tenantId` (PK) | A tenant is **one partition**, so the worker reads it with a `Query` bounded by that tenant's member count, never a `Scan` of the platform. |
+| `ownerId` (SK) | Members of a shared tenant are **separate items**; the worker applies their union. Sharing an IPSet is a config choice, not a second code path. |
+| `version` | The optimistic lock. `If-Match` becomes the DynamoDB condition, so a lost update is impossible rather than unlikely. |
+| `syncedVersion` | Written **only** by the worker, after WAF accepts the change. `syncStatus` is *derived* from `syncedVersion == version`, never stored, so it cannot drift from the data it describes. |
+
+A write is a `PutItem` that replaces the whole item, dropping `syncedVersion` — so a new
+version starts `PENDING` by construction, not by a flag someone has to remember to clear.
+
+The API has `GetItem` and `PutItem` only — **no `Query`, no `Scan`** — so a leaked credential
+cannot enumerate another user's allowlist, let alone the whole platform's.
+
+### SQS FIFO — the mutex
+
+The queue is not transport; the API could invoke the Lambda directly. It is here because
+`MessageGroupId` is the **tenant** on every producer, and FIFO allows one in-flight batch per
+group. So:
+
+- Two members of one tenant saving at once **reconcile in sequence**, never as two concurrent
+  writers to one IPSet, so `WAFOptimisticLockException` cannot arise between two edits.
+- Different tenants proceed in parallel.
+- The 15-minute sweep is grouped the same way, so it queues *behind* a tenant's edits instead
+  of colliding with them.
+- `MessageDeduplicationId` is `tenant:owner:version` — per logical edit, so an SDK retry
+  collapses to one message while a genuine second edit is never swallowed by the 5-minute
+  dedup window.
+- A permanently failed message parks on the **DLQ** with its payload intact and is replayed
+  with one `start-message-move-task` call.
+
+### The Lambda — the single writer
+
+It **ignores the message contents** and rebuilds the IPSet from the table. That one decision
+is what makes retries, redeliveries, duplicate messages and scheduled sweeps all converge on
+the same result, and lets a drifted IPSet self-heal.
+
+On failure it returns **only the failed tenants' message ids**
+(`ReportBatchItemFailures`), so one tenant's WAF problem does not tick nine healthy tenants
+toward the DLQ threshold.
+
+### The 15-minute sweep
+
+EventBridge `rate(15 minutes)` puts one message per tenant on the same queue. The worker
+cannot tell it from an edit — same rebuild, same code path. It closes three gaps:
+
+| Gap | Why the sweep covers it |
+| --- | ----------------------- |
+| The write and the send are **not atomic** | If the pod dies between `PutItem` and `SendMessage`, the edit is durable but unsignalled. 15 minutes bounds that, and it reads `PENDING` throughout. |
+| **Drift** | A console edit is reverted, because desired state is the table, not WAF. |
+| **Silent divergence** | Any partial failure the DLQ alarm would not catch self-heals. |
+
+If the IPSet already matches, the worker skips the WAF write entirely — a quiet platform
+costs nothing.
+
+### Break-glass
+
+`break_glass_cidrs` ([prod.tfvars](terraform/prod.tfvars)) is merged into **every** IPSet on
+every sync, so an empty table can never lock the ops team out of the CMS. It is validated as
+IPv4 because the IPSets are; a v6 range would apply cleanly in Terraform and then fail every
+`UpdateIPSet`. A break-glass role is also exempt from the SCP that denies manual IPSet edits:
+if the sync path is broken *and* the allowlist is wrong, someone still needs a way in.
+
+### Why no stream or Pipe
+
+Change-data-capture earns its place when you do not control the writer. Here the API is the
+only writer and already knows the tenant id, so it sends the signal itself — removing a Pipe
+per tenant, its IAM role, and the filter that stopped the worker's own acknowledgements
+re-triggering it. The cost is the non-atomic write/send above, which the sweep bounds.
+
+## Assumptions
+
+| # | Assumption | Why |
+| - | ---------- | --- |
+| 1 | **Authentication is delegated.** | The portal signs users in against an IdP; this API only *verifies*. The HS256 secret and in-repo directory stand in for that — swapping in JWKS is a change to [jwt.ts](backend/src/lib/jwt.ts) alone. |
+| 2 | **A user owns one list; a tenant owns one IPSet.** | Agencies sharing an IPSet share a tenant key as separate items; isolated agencies get their own key. One code path, not two modes. |
+| 3 | **Terraform owns the IPSet; the app owns its addresses.** | `ignore_changes = [addresses]` — without it the next apply empties every IPSet and locks tenants out until the next sync. |
+| 4 | **Eventual consistency is acceptable, and visible.** | The response says `APPLIED` or `PENDING` rather than implying enforcement it cannot confirm. |
+| 5 | **Rebuild beats merge.** | Simpler and idempotent, bounded by tenant size not platform size. A tenant stays far inside WAF's 10,000-address limit (50 × 200 users). |
+| 6 | **Full-list replacement, not add/remove.** | Matches how the portal edits a list, and removes the ambiguity of concurrent partial edits. |
+| 7 | **Only public, routable ranges.** | Allowlisting RFC1918 space on an internet-facing WAF is meaningless at best, so it is rejected at the edge rather than silently ignored by WAF. |
+
+### 8. IPv4 only — IPv6 is rejected, not ignored
+
+WAF IPSets are **single-family**, and the ones this platform provisions are `IPV4`. A v6
+range would be stored, reported `PENDING`, and never go live — the API promising something
+the infrastructure cannot deliver. So it is a `400` with its own reason string, distinct from
+"not a valid IP", because a typo and an unsupported address family are different problems for
+the caller:
+
+```json
+{ "error": "Invalid IP allowlist",
+  "reasons": ["\"2001:db8::/48\": IPv6 is not supported, use an IPv4 address or CIDR"] }
+```
+
+Supporting it properly is three changes, none of them large: a **second IPSet per tenant**
+(`IPV6` scope) in `modules/waf_ip_sets`, **family routing** in the worker so each address
+lands in the matching set, and **both sets referenced** from the CMS WebACL rule. The API
+change is one branch in [cidr.ts](backend/src/lib/cidr.ts) — `isIPv6` is already detected
+there, it just refuses instead of dispatching. Until the WebACL side exists, rejecting is the
+honest answer.
 
 ## Running it
 
-There is **no local DynamoDB**. The API talks to the real tables, so the order is:
-`terraform apply` → read the outputs → put them in `.env` → run the API. A write then goes
-through the whole pipeline and `syncStatus` flips to `APPLIED` within seconds, which is the
-only way to see the system actually work.
-
-You need Node 24 (`nvm use` — an `.nvmrc` is provided), Terraform ≥ 1.10, and AWS
-credentials for an account you may create resources in.
-
-### 1. Apply the infrastructure
-
-Edit [terraform/prod.tfvars](terraform/prod.tfvars) first — the tenants you want, your real
-break-glass ranges and a real alert address — then:
+There is **no local DynamoDB**: `terraform apply` → outputs → `.env` → run the API. A write
+then goes through the whole pipeline and flips to `APPLIED` within seconds. Needs Node 24
+(`nvm use`), Terraform ≥ 1.10, and AWS credentials.
 
 ```bash
-make state-bucket     # once per account: versioned, encrypted, public access blocked
-make init
-make plan             # builds the Lambda package first, uses -var-file=prod.tfvars
-make apply
-```
+# 1. Infrastructure. Edit terraform/prod.tfvars first: your tenants, real
+#    break-glass ranges, a real alert address.
+make state-bucket     # once per account, as an administrator
+make init && make plan && make apply
 
-This creates the DynamoDB table (`websg-cms-allowlist`, shared by every tenant), one WAF
-IPSet per tenant (`websg-cms-allowlist-<tenant>`), the FIFO queue and DLQ, the sync Lambda,
-the drift-check schedule and the alarms. `make state-bucket` needs `s3:CreateBucket`, which
-is deliberately outside the deploy policy — run it once as an administrator.
-
-If you use your own state bucket, set `bucket` in the backend block of
-[terraform/providers.tf](terraform/providers.tf) and `STATE_BUCKET` in the
-[Makefile](Makefile) before `make init`.
-
-### 2. Fill `.env` from the outputs
-
-```bash
-cd backend
-nvm use
-npm install
-cp .env.example .env
-```
-
-Then read the three values the API needs out of Terraform and put them in `.env`:
-
-```bash
-terraform -chdir=../terraform output -raw table_name       # → TABLE_NAME
+# 2. Config
+cd backend && nvm use && npm install && cp .env.example .env
+terraform -chdir=../terraform output -raw table_name        # → TABLE_NAME
 terraform -chdir=../terraform output -raw sync_queue_url    # → SYNC_QUEUE_URL
 terraform -chdir=../terraform output -raw region            # → AWS_REGION
+
+# 3. Run
+npm run dev           # http://localhost:3000
 ```
 
-Also set `JWT_SECRET` to any non-empty string — it signs and verifies the local access
-tokens, and the API refuses to boot without it. Set `AWS_PROFILE` if the credentials you
-want are not in your default profile; the SDK reads `~/.aws/credentials`, so never put keys
-in `.env`. Those credentials need [iam/backend-api-policy.json](iam/backend-api-policy.json)
-(`GetItem` + `PutItem` on the table, `SendMessage` on the queue).
+Set `JWT_SECRET` to any non-empty string — the API refuses to boot without it. Use
+`AWS_PROFILE` rather than putting keys in `.env`; those credentials need
+[iam/backend-api-policy.json](iam/backend-api-policy.json). Everything else in `.env.example`
+has a working default.
 
-Everything else in `.env.example` has a working default.
+`make apply` creates the table, one IPSet per tenant, the FIFO queue and DLQ, the Lambda, the
+drift schedule and the alarms. `make state-bucket` needs `s3:CreateBucket`, deliberately
+outside the deploy policy.
 
-### 3. Run the API
+### Using it
 
-```bash
-npm run dev           # http://localhost:3000, watch mode
-```
-
-In a second terminal — `cd backend` again, since `npm run token` needs the package
-scripts — mint a token and use it. Users come from
-[src/config/users.ts](backend/src/config/users.ts) — the token proves who you are, the
-directory decides which tenant you own, so a forged claim cannot reach another tenant:
-
-| User | Tenant | Note |
-| ---- | ------ | ---- |
-| `user-a` | `tenant-a` | own table, own IPSet |
-| `user-b` | `tenant-b` | own table, own IPSet |
-| `user-c` | `tenant-shared` | shares a table and IPSet with `user-d` |
-| `user-d` | `tenant-shared` | shares a table and IPSet with `user-c` |
+Users come from [src/config/users.ts](backend/src/config/users.ts) — `user-a`/`tenant-a`,
+`user-b`/`tenant-b`, and `user-c`+`user-d` sharing `tenant-shared`. The token proves who you
+are; the directory decides which tenant you own, so a forged claim cannot reach another
+tenant.
 
 ```bash
 export API=http://localhost:3000
-export TOKEN=$(npm run token --silent -- user-a)
+export TOKEN=$(npm run token --silent -- user-a)   # run inside backend/
 
-# Read the current list (a new user gets an empty list at version 0)
 curl -s $API/v1/allowlist -H "authorization: Bearer $TOKEN"
 
-# Replace it. If-Match carries the version you last read - 0 here because the
-# list above is new. It is required on every PUT; without it the answer is 428.
 curl -isX PUT $API/v1/allowlist \
   -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
-  -H 'if-match: 0' \
-  -d '{"cidrs":["203.0.113.9","198.51.100.0/24"]}'
+  -H 'if-match: 0' -d '{"cidrs":["203.0.113.9","198.51.100.0/24"]}'
 ```
 
-If `$TOKEN` is empty the API answers `{"error":"missing bearer token"}` — that means
-`npm run token` ran outside `backend/`, not that the token was rejected.
+That returns `version: 1`, the normalised list `["198.51.100.0/24","203.0.113.9/32"]`, and an
+`ETag` to use as the next `If-Match`.
 
-The write returns the stored record with `version: 1` and the normalised list
-`["198.51.100.0/24","203.0.113.9/32"]`, plus an `ETag` header carrying the new version —
-send that as the next `If-Match`, so a write never needs a re-read:
+**Adding or removing one IP** is a read, an edit, and a full `PUT` (assumption 6) — recipes
+in [TESTING.md](TESTING.md#adding-and-removing-one-ip), which also covers the one trap:
+removal is by exact string and the stored form is normalised, so subtracting `203.0.113.9`
+from a list holding `203.0.113.9/32` removes nothing while still succeeding.
+
+### Tests
 
 ```bash
-V=$(curl -s $API/v1/allowlist -H "authorization: Bearer $TOKEN" | jq -r .version)
-curl -sX PUT $API/v1/allowlist \
-  -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
-  -H "if-match: $V" -d '{"cidrs":["203.0.113.0/24"]}'
+make test                          # both suites, no AWS credentials, no server
+cd backend && npm test             # 39 tests, node:test
+cd ../lambda && npm test           # 19 tests
 ```
 
-### 4. Check the scenarios
-
-[ARCHITECTURE.md](ARCHITECTURE.md) has a copy-pasteable walkthrough for each behaviour worth
-proving: shared vs per-tenant IPSets, waiting for a change to go live, concurrent edits,
-rejected input, tenant isolation, a manual WAF edit being reverted, a failed sync, and
-onboarding a tenant. Run them against the server from step 3.
-
-To confirm a change really landed in WAF:
-
-```bash
-aws wafv2 get-ip-set --scope REGIONAL \
-  --name websg-cms-allowlist-tenant-a \
-  --id $(terraform -chdir=terraform output -json ip_sets | \
-         jq -r '."websg-cms-allowlist-tenant-a".id')
-```
-
-### Tests and checks
-
-The suites need no AWS credentials and no running server — the backend uses an in-memory
-repository and the Lambda stubs the SDK transport. **[TESTING.md](TESTING.md)** maps every
-test to the behaviour it holds up, split into separate-IPSet isolation and shared-IPSet
-union, and is honest about what sharing an IPSet costs you.
-
-```bash
-make test                      # both suites
-
-cd backend && npm test         # 33 tests, node:test - no test framework dependency
-npm run typecheck
-npm run build                  # emits dist/ for the container image
-
-cd ../lambda && npm test       # 12 tests
-```
-
-TypeScript runs directly under Node 24's built-in type stripping, so there is no `ts-node`
-or bundler in the toolchain.
+TypeScript runs under Node 24's type stripping — no `ts-node`, no bundler.
 
 ## API
 
-Every route under `/v1` requires a `Bearer` token. **There is no tenant or user id in any
-path** — a caller only ever addresses its own list, so cross-tenant access is impossible
-rather than merely rejected.
+Every `/v1` route needs a `Bearer` token. **No tenant or user id appears in any path**, so
+cross-tenant access is impossible rather than merely rejected.
 
-### `GET /v1/allowlist`
+**`GET /v1/allowlist`** returns the caller's own record (see the DynamoDB item above, plus
+`syncStatus`). A user who has never written gets an empty list at `version: 0`.
 
-```json
-{ "ownerId": "user-a", "tenantId": "tenant-a", "cidrs": ["198.51.100.0/24"],
-  "version": 3, "updatedAt": "2026-08-11T09:12:00.000Z",
-  "syncStatus": "APPLIED", "syncedVersion": 3, "syncedAt": "2026-08-11T09:12:04.000Z" }
-```
-
-A user who has never submitted a list gets an empty list at `version: 0`.
-
-### `PUT /v1/allowlist`
-
-Full replacement — the portal always sends the complete set, so there is no partial-update
-ordering problem.
-
-```
-If-Match: 3
-Content-Type: application/json
-
-{ "cidrs": ["203.0.113.9", "198.51.100.0/24"] }
-```
-
-`If-Match` is mandatory — there is no unconditional write. It must be a non-negative
-integer: the version you last read, or `0` for the first write to a list that does not
-exist yet. The value becomes the DynamoDB condition on the write
-([repository.ts](backend/src/modules/ip-allowlist/repository.ts)), which is what makes a
-lost update impossible rather than merely unlikely.
-
-Responses:
+**`PUT /v1/allowlist`** is a full replacement. `If-Match` is mandatory — the version you last
+read, or `0` for a list that does not exist yet.
 
 | Code | Meaning |
 | ---- | ------- |
 | `200` | stored **and** confirmed live in WAF — `syncStatus: "APPLIED"` |
-| `202` | stored and durable, not yet confirmed — `syncStatus: "PENDING"`, poll `GET` |
+| `202` | stored and durable, not yet confirmed — `PENDING`, poll `GET` |
 | `400` | invalid input, with a reason per rejected entry |
 | `401` | bad or missing token, or a user not in the directory |
 | `409` | stale `If-Match` — someone else wrote since you read |
 | `428` | missing `If-Match` |
 
-The write waits up to `SYNC_WAIT_MS` (15s) for the worker's acknowledgement so the caller
-usually gets a definitive `200` instead of having to poll. If the window elapses the answer
-is honestly `202`; the write is durable either way. `syncStatus` is derived from
-`syncedVersion == version`, never stored, so it cannot drift from the data it describes.
+**`GET /healthz`, `GET /readyz`** — unauthenticated probes for Kubernetes and the ALB.
 
-### `GET /healthz`, `GET /readyz`
+## Layout
 
-Unauthenticated probes for the Kubernetes deployment and ALB target group.
+```
+backend/       Fastify + TypeScript API (pod on the CMS EKS cluster)
+  src/config/                 env loading, policy limits, the user directory
+  src/lib/                    framework-free: cidr validation, jwt, domain errors
+  src/plugins/                cross-cutting Fastify wiring: auth, error mapping
+  src/modules/ip-allowlist/   the feature: routes → service → repository
+  src/app.ts                  composition root (dependencies injected, no globals)
+lambda/        SQS → WAF v2 sync worker
+terraform/     main.tf + prod.tfvars + five modules
+iam/           least-privilege policies (deploy role, backend, SCP)
+```
 
-## Security controls
+Layering is one-directional: `routes` (HTTP) → `service` (rules) → `repository` (AWS). `lib/`
+knows nothing about Fastify or the AWS SDK, which is why its tests need no mocks. `app.ts`
+takes dependencies as arguments, so tests build the app the pod runs.
+
+## Security
 
 | Control | Where |
 | ------- | ----- |
-| JWT verified with a pinned issuer, audience and a fixed algorithm list — never trusts the token header's `alg` | [jwt.ts](backend/src/lib/jwt.ts) |
-| The tenant comes from the server-side directory, never from a token claim | [users.ts](backend/src/config/users.ts) |
-| No id in any route — a caller cannot even express a cross-tenant request | [routes.ts](backend/src/modules/ip-allowlist/routes.ts) |
-| Schema validation — types, array/string bounds, `additionalProperties: false`, 64 KB body limit | [schemas.ts](backend/src/modules/ip-allowlist/schemas.ts) |
-| Semantic IP validation — canonical CIDR, host-bit check, private/loopback/link-local/CGNAT/multicast rejected, max 50 entries, ranges broader than `/24` (v4) or `/48` (v6) rejected | [cidr.ts](backend/src/lib/cidr.ts) |
-| Optimistic locking — `If-Match` plus a DynamoDB conditional write, so two portal tabs cannot silently overwrite each other | [repository.ts](backend/src/modules/ip-allowlist/repository.ts) |
-| Error responses never leak stack traces or AWS errors | [error-handler.ts](backend/src/plugins/error-handler.ts) |
-| Break-glass CIDRs merged into every sync, so an empty table can never lock the ops team out | [index.ts](lambda/src/index.ts) |
-| Tables have SSE, PITR and deletion protection; the queue and SNS topic are encrypted | [terraform/modules/](terraform/modules/) |
+| JWT verified with pinned issuer, audience and a fixed algorithm list — never trusts the token's `alg` | [jwt.ts](backend/src/lib/jwt.ts) |
+| Tenant resolved from the server-side directory, never from a token claim | [users.ts](backend/src/config/users.ts) |
+| No id in any route — a cross-tenant request cannot be expressed | [routes.ts](backend/src/modules/ip-allowlist/routes.ts) |
+| Schema validation — types, bounds, `additionalProperties: false`, 64 KB body limit | [schemas.ts](backend/src/modules/ip-allowlist/schemas.ts) |
+| Semantic IP validation — canonical CIDR, host-bit check, private/loopback/link-local/CGNAT/multicast rejected, max 50 entries, nothing broader than `/24` | [cidr.ts](backend/src/lib/cidr.ts) |
+| Optimistic locking — `If-Match` plus a conditional write | [repository.ts](backend/src/modules/ip-allowlist/repository.ts) |
+| Errors never leak stack traces or AWS errors | [error-handler.ts](backend/src/plugins/error-handler.ts) |
+| SSE, PITR and deletion protection on the table; queue and topic encrypted | [terraform/modules/](terraform/modules/) |
 
-Rate limiting and TLS termination are left to the API Gateway/ALB in front of the service
-rather than duplicated in application code.
+Rate limiting and TLS termination belong to the ALB in front, not duplicated in application
+code.
 
-## Assumptions
+**Only the application writes IPSet addresses**, in three layers: `ignore_changes` stops
+Terraform reverting the app, the 15-minute sweep undoes console edits, and an SCP denies
+`wafv2:UpdateIPSet` to everyone but the worker and break-glass roles. Prevent, repair, and
+don't self-inflict. Policies and the reasoning are in [iam/](iam/).
 
-1. **Authentication is delegated.** In production the portal signs users in against an
-   existing IdP and this API only *verifies* tokens — no session, password or user store
-   here. The HS256 secret and the in-repo user directory stand in for that IdP so the whole
-   thing runs and tests without one; swapping in JWKS verification is a change to
-   [jwt.ts](backend/src/lib/jwt.ts) alone.
-2. **A user owns one list; a tenant owns one IPSet.** Agencies that must share an IPSet
-   share a tenant key and are separate items in that tenant's partition — the worker applies
-   the union. Agencies that must be isolated get their own tenant key. Shared and per-tenant
-   are one code path, not two modes.
-3. **Terraform owns the IPSet resource; the application owns its addresses.**
-   `ignore_changes = [addresses]` is what makes that safe — without it the next
-   `terraform apply` empties every IPSet and locks tenants out until the next sync.
-4. **Eventual consistency is acceptable, and visible.** Propagation takes seconds. The
-   response says `APPLIED` or `PENDING` rather than implying enforcement it cannot confirm.
-5. **Rebuild beats merge.** The worker re-reads a tenant's whole partition rather than
-   applying deltas — simpler, idempotent, and bounded by that tenant's member count rather
-   than by the size of the platform, so this does not depend on the platform staying small.
-   A tenant stays far inside the 10,000-address WAF IPSet limit (50 entries × 200 users).
-6. **Full-list replacement, not add/remove.** Matches how the portal UI edits a list, and
-   removes the ambiguity of concurrent partial edits.
-7. **Tenants may only submit public, routable ranges.** Allowlisting RFC1918 space on an
-   internet-facing WAF is meaningless at best and misleading at worst, so it is rejected at
-   the edge rather than silently ignored by WAF.
-8. **IPv4 only.** WAF IPSets are single-family and these are `IPV4`, so the API rejects IPv6
-   with a 400 that says so. Accepting an address family the infrastructure cannot hold would
-   mean storing a range that reports `PENDING` and never goes live.
-
-## Infrastructure
-
-Terraform lives in [terraform/](terraform/): a flat root (`main.tf`, `variables.tf`,
-`outputs.tf`, `providers.tf`) wiring five modules. The state bucket is created by the
-[Makefile](Makefile) rather than a bootstrap stack — that stack would need its own state,
-which is the problem it exists to solve.
-
-Day to day, Terraform runs in GitLab CI ([.gitlab-ci.yml](.gitlab-ci.yml)): plan on every
-merge request, apply manually from `main`, credentials from GitLab OIDC — no long-lived AWS
-keys. The apply consumes the reviewed plan file, so what was approved is what runs.
-
-| Module | Creates |
-| ------ | ------- |
-| `modules/dynamodb` | the allowlist table — `PK tenantId` / `SK ownerId`, PITR, SSE |
-| `modules/waf_ip_sets` | one **WAF IPSet** per tenant, `IPV4`, addresses ignored |
-| `modules/queue` | the **SQS FIFO queue**, its **DLQ**, and the per-tenant drift-check schedule |
-| `modules/lambda` | the function, its least-privilege role, the event source mapping |
-| `modules/monitoring` | SNS topic and the **CloudWatch alarms** |
-
-**Onboarding a tenant is one entry in `prod.tfvars`** — no code change, no redeploy. The
-worker reads the tenant → IPSet mapping from its `TENANTS` environment variable, which
-Terraform renders. There is no new table to create: the tenant is a partition key in the
-existing one.
-
-**Only the application writes IPSet addresses**, enforced in three layers:
-`ignore_changes = [addresses]` stops Terraform reverting the app; a scheduled drift check
-re-reconciles every 15 minutes so console edits are undone; and an SCP denies
-`wafv2:UpdateIPSet` to everyone but the worker role and a break-glass role. Prevent, repair,
-and don't self-inflict.
-
-[terraform/README.md](terraform/README.md) has the design notes and the DLQ runbook.
-
-### Permissions
-
-[iam/](iam/) holds three least-privilege policies: the deploy role GitLab CI assumes, the
-backend's, and the SCP above. All name their resources rather than using `*`. Two details
-worth calling out: `iam:PassRole` is conditioned on `iam:PassedToService`, because
-create-a-role plus pass-it-anywhere is a privilege-escalation path; and creating the state
-bucket is deliberately outside the deploy policy, so the pipeline cannot reconfigure its own
-state.
-
-The backend gets exactly `dynamodb:GetItem` and `PutItem` on the one table, plus
-`sqs:SendMessage` on the queue. **No `Query` and no `Scan`**, so a leaked credential cannot
-dump another user's allowlist — or, on a single table, the whole platform's. The same policy
-covers the pod's IRSA role and local development.
-
-Failure handling is the part worth reading. A failed reconcile returns **only that tenant's
-messages** to the queue (`ReportBatchItemFailures`); after 5 deliveries SQS parks them on the
-FIFO DLQ and the alarm fires. Any message there matters, because **nothing on the API side
-fails when sync stalls** — tenants keep getting successful writes and `syncStatus` simply
-stays `PENDING`. Recovery is a redrive (`aws sqs start-message-move-task`), not a manual
-replay.
-
-The DLQ alarm only fires after five failures, so it says nothing about a sync that is merely
-not finishing. For that the worker emits `OldestUnacknowledgedAgeSeconds` per tenant as
-embedded metric format, and a `sync-stuck-<tenant>` alarm fires above 5 minutes — enough to
-tell *slow* from *stuck* without consuming the DLQ.
+**Onboarding a tenant is one entry in `prod.tfvars`** — no code change, no redeploy, no new
+table. Terraform renders the worker's `TENANTS` variable.
 
 ## Bonus
 
-### Tenant-specific IP allowlists — implemented
+### 1. Tenant-specific IP allowlists — implemented
 
-This is built, not just proposed: `modules/waf_ip_sets` creates an IPSet per tenant and the
-worker reconciles each from that tenant's own partition. What remains is the WAF rule side,
-which lives with the CMS WebACL:
+Not a proposal: `modules/waf_ip_sets` already creates an IPSet per tenant and the worker
+reconciles each from its own partition. Both shapes work today and are the same code path:
 
-1. One rule per tenant: `Host == <tenant>.cms.websg.gov.sg AND NOT ip in <tenant IPSet>` →
-   `Block`, with a default `Block` fallback. The `ip_sets` output exports the ids to
-   reference.
-2. WebACL rules are capped (1,500 WCU), so past roughly a hundred tenants those per-tenant
-   rules move behind a **single rule backed by a Lambda@Edge / CloudFront Function** doing a
+| Shape | Config | Result |
+| ----- | ------ | ------ |
+| Dedicated | one tenant key per agency | full isolation; A's ranges never touch B's IPSet |
+| Shared | several agencies on one tenant key | one IPSet holding the union; each still edits only its own list |
+
+What remains is the WAF rule side, which lives with the CMS WebACL:
+
+1. One rule per tenant — `Host == <tenant>.cms.websg.gov.sg AND NOT ip in <tenant IPSet>` →
+   `Block`, with a default `Block` fallback. The `ip_sets` output exports the ids.
+2. WebACL rules are capped at 1,500 WCU, so past roughly a hundred tenants those per-tenant
+   rules move behind a **single rule backed by a CloudFront Function / Lambda@Edge** doing a
    `host + client IP` lookup against a DynamoDB or DAX-cached map — one rule, unbounded
    tenants.
 
-Moving an agency between a shared and a dedicated IPSet is a `prod.tfvars` change plus
-moving its item. No API or portal contract change.
+Moving an agency between shared and dedicated is a `prod.tfvars` change plus moving its item.
+No API or portal contract change.
 
-### Additional self-service setting
+### 2. A second self-service setting — HPA replicas
 
-**HPA min/max replicas per tenant website**, which the brief lists as a common service
-request. It fits the same shape — a validated, bounded value written to the same table — but
-the apply path differs: Kubernetes state is GitOps-managed, so instead of a WAF call the
-worker opens a **pull request against the manifests repo** (or writes a per-tenant values
-file that ArgoCD reconciles). That keeps the GitOps repo as the single source of truth and
-preserves review for anything that costs money, while still removing the ticket. Bounds
-(e.g. max 10 replicas) are enforced by the API against the tenant's service tier.
+**Min/max replicas per tenant website.** Same shape as the IP list — a validated, bounded
+value written to the same table, same `version` lock, same `PENDING`/`APPLIED` reporting — so
+the API, the queue and the status model are reused unchanged. Only the *apply* step differs:
 
-A lighter alternative with exactly the same plumbing as the IP list is the **WAF rate-limit
-threshold** per tenant, applied to a rate-based rule.
+| | IP allowlist | HPA replicas |
+| - | ------------ | ------------ |
+| Stored | `cidrs: string[]` | `{ minReplicas, maxReplicas }` |
+| Validated against | public routable IPv4, ≤ 50 entries, ≥ `/24` | the tenant's service tier (e.g. max 10) |
+| Applied by | `wafv2:UpdateIPSet` | a **pull request against the GitOps manifests repo** |
+| Live when | WAF accepts the update | ArgoCD syncs the merged PR |
+
+The apply path is a PR rather than a direct write because Kubernetes state is GitOps-managed:
+writing to the cluster behind ArgoCD's back would be reverted on the next reconcile, and it
+would move the source of truth out of the repo. A PR keeps the repo authoritative and
+preserves review for anything that costs money, while still removing the ticket. The tenant
+sees `PENDING` until the PR merges, which is honest — the change genuinely is not live yet.
+
+A lighter alternative with *exactly* the same plumbing as the IP list is the **WAF rate-limit
+threshold** per tenant, applied to a rate-based rule: one more `UpdateWebACL` call in the same
+worker, no new apply path at all.

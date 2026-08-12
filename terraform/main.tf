@@ -8,13 +8,11 @@ locals {
     ManagedBy   = "terraform"
   }
 
-  // One tenant = one IPSet named "<name>-<tenant>". Adding a tenant is an entry
-  // in var.tenants; no code change, no redeploy. All tenants share one table,
-  // partitioned by tenant id.
+  // One tenant = one IPSet "<name>-<tenant>" + a partition in the shared table.
+  // Adding one is an entry in var.tenants: no code change, no redeploy.
   ip_set_names = { for id, t in var.tenants : id => "${local.name}-${id}" }
 }
 
-// One table for the whole platform, PK = tenantId / SK = ownerId.
 module "allowlist" {
   source = "./modules/dynamodb"
 

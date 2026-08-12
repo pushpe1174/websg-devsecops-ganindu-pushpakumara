@@ -1,12 +1,8 @@
-// Alerting for the sync worker.
-//
-// The DLQ alarm is the one that matters for hard failure: when a batch is
-// parked, nothing on the API side fails. Tenants keep saving successfully while
-// their changes stop reaching WAF.
-//
-// The stuck-sync alarm covers the other half - the case where nothing has failed
-// hard enough to reach the DLQ but edits are still not going live. Together they
-// answer "is sync broken?" without the API needing a stored FAILED status.
+// Alerting for the sync worker. Nothing on the API side fails when sync breaks -
+// tenants keep saving while their changes stop reaching WAF - so the DLQ alarm
+// covers hard failure and the stuck-sync alarm covers edits that are simply not
+// going live. Together they answer "is sync broken?" without a stored FAILED
+// status on the API.
 
 resource "aws_sns_topic" "alerts" {
   name              = "${var.name_prefix}-alerts"
@@ -44,14 +40,11 @@ resource "aws_cloudwatch_metric_alarm" "dlq_not_empty" {
   tags = var.tags
 }
 
-// Slow vs stuck. The worker reports, per tenant, how old its oldest
-// unacknowledged edit was at the moment it read the partition: a few seconds on
-// a healthy platform, growing across sweeps when something is wedged.
-//
-// The period matches the sweep interval, so there is one datapoint per tenant
-// per sweep and "missing" genuinely means the worker never ran for that tenant.
-// Worst-case detection is therefore two sweeps, not two minutes - this is a
-// backstop for the DLQ alarm, not a first responder.
+// Slow vs stuck: the age of each tenant's oldest unacknowledged edit, seconds on
+// a healthy platform and growing across sweeps when wedged. The period matches
+// the sweep interval, so there is one datapoint per tenant per sweep and
+// "missing" means the worker never ran. Detection takes two sweeps - a backstop
+// for the DLQ alarm, not a first responder.
 resource "aws_cloudwatch_metric_alarm" "sync_stuck" {
   for_each = var.tenant_ids
 

@@ -1,12 +1,9 @@
-// One shared SQS FIFO queue between the API and the reconciler.
+// SQS FIFO between the API and the reconciler. A mutex, not transport:
+// MessageGroupId is the tenant on every producer, and FIFO allows one in-flight
+// batch per group, so no IPSet ever has two concurrent writers.
 //
-// The queue earns its keep as a mutex, not as transport. MessageGroupId is the
-// tenant id on every producer - the API and the scheduled sweep alike - and FIFO
-// allows one in-flight batch per group, so there is never a second concurrent
-// writer to a tenant's IPSet and WAFOptimisticLockException cannot occur.
-//
-// The message carries no data. The worker rebuilds a tenant's IPSet from the
-// table, so duplication, reordering and redelivery are all harmless.
+// The message carries no data - the worker rebuilds from the table - so
+// duplication, reordering and redelivery are harmless.
 
 resource "aws_sqs_queue" "dlq" {
   name       = "${var.name}-dlq.fifo"
@@ -22,13 +19,10 @@ resource "aws_sqs_queue" "main" {
   name       = "${var.name}.fifo"
   fifo_queue = true
 
-  // For the sweep only. EventBridge has no dedup-id field on an SQS target, so
-  // FIFO delivery needs this; the input transformer stamps the event time to
-  // keep each check distinct within the 5-minute window.
-  //
-  // The API does not rely on it: it sends an explicit MessageDeduplicationId of
-  // tenant:owner:version, which takes precedence. That id is per logical edit,
-  // so an API retry collapses while a genuine second edit is never swallowed.
+  // For the sweep only: EventBridge has no dedup-id field on an SQS target, and
+  // the input transformer stamps the event time to keep each check distinct.
+  // The API overrides it with tenant:owner:version, which is per logical edit -
+  // a retry collapses, a genuine second edit is never swallowed.
   content_based_deduplication = true
 
   // Must exceed the function timeout, or a slow run is redelivered while the
@@ -47,10 +41,9 @@ resource "aws_sqs_queue" "main" {
 
 // ------------------------------------------------------------ Drift check
 //
-// Two jobs. It reverts a manual console edit to an IPSet, which edits alone
-// would leave in place until the next tenant write. And it bounds the cost of a
-// lost signal: the DynamoDB write and the SQS send are not atomic, so a write
-// that never produced a message is picked up here instead of hanging PENDING.
+// Two jobs: revert console edits to an IPSet, which would otherwise survive
+// until the tenant's next write; and bound the cost of a lost signal, since the
+// DynamoDB write and the SQS send are not atomic.
 
 resource "aws_cloudwatch_event_rule" "drift_check" {
   name                = "${var.name}-drift-check"
@@ -60,10 +53,9 @@ resource "aws_cloudwatch_event_rule" "drift_check" {
   tags = var.tags
 }
 
-// One target per tenant, each in that tenant's message group. A sweep therefore
-// queues behind that tenant's edits instead of running alongside them - without
-// this, the sweep would be the one producer able to collide on the lock token
-// that every other producer is arranged to protect.
+// One target per tenant, in that tenant's message group, so a sweep queues
+// behind its edits. Without this the sweep would be the one producer able to
+// collide on the lock token everything else is arranged to protect.
 resource "aws_cloudwatch_event_target" "drift_check" {
   for_each = var.tenant_ids
 

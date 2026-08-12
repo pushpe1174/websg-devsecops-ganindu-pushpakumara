@@ -13,13 +13,10 @@ type Allowlist = {
 };
 
 const env = {
-  // The one allowlist table, partitioned by tenant id.
   tableName: process.env.TABLE_NAME ?? '',
-  // Tenant -> its IPSet, written by Terraform. Onboarding a tenant is an apply,
-  // never a code change.
+  // Written by Terraform, so onboarding a tenant is an apply, not a code change.
   tenants: JSON.parse(process.env.TENANTS ?? '{}') as Record<string, Tenant>,
-  // Ops/break-glass ranges added to every IPSet, so an empty partition can never
-  // lock everyone out of the CMS.
+  // Merged into every IPSet, so an empty partition cannot lock ops out.
   breakGlass: (process.env.BREAK_GLASS_CIDRS ?? '').split(',').map((s) => s.trim()).filter(Boolean),
   metricNamespace: process.env.METRIC_NAMESPACE ?? 'WebSG/Allowlist',
 };
@@ -28,12 +25,9 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 const waf = new WAFV2Client({});
 
 /**
- * Reconciles each tenant's IPSet from that tenant's partition of the allowlist
- * table: one partition, one IPSet. Agencies sharing a tenant share its
- * partition, so their ranges are simply the union of the items in it.
- *
- * The message is only a signal - state is rebuilt from the table - so retries,
- * redelivery and the scheduled sweep all converge on the same answer.
+ * Rebuilds each tenant's IPSet from its partition: one partition, one IPSet,
+ * shared tenants being the union of their items. The message is only a signal -
+ * state comes from the table - so retries and the sweep converge on one answer.
  */
 export async function handler(event: SQSEvent): Promise<SQSBatchResponse> {
   const batch = parseBatch(event);
@@ -63,16 +57,15 @@ export async function handler(event: SQSEvent): Promise<SQSBatchResponse> {
       await reconcile(tenant, desired);
       await confirmApplied(id, allowlists);
     } catch (err) {
-      // Keep going: one tenant's problem must not block every other tenant.
+      // Keep going: one tenant must not block the rest.
       failed.add(id);
       console.error(JSON.stringify({ msg: 'tenant sync failed', tenant: id, error: String(err) }));
     }
   }
 
-  // Return only the messages belonging to tenants that failed, so a single bad
-  // tenant does not push nine healthy ones toward the DLQ. Requires
-  // ReportBatchItemFailures on the event source mapping - without it, an empty
-  // response means "all succeeded" and the failures are silently dropped.
+  // Only the failed tenants' messages return, so one bad tenant does not push
+  // healthy ones toward the DLQ. Needs ReportBatchItemFailures on the event
+  // source mapping; without it an empty response means "all succeeded".
   const batchItemFailures = [...failed]
     .flatMap((id) => batch.messageIds.get(id) ?? [])
     .concat(failed.size > 0 ? batch.sweepMessageIds : [])
@@ -101,11 +94,9 @@ type Batch = {
 };
 
 /**
- * Works out which tenants this batch is about, from the `tenantId` each message
- * carries - the API stamps it on a write, the scheduled sweep stamps it per
- * target. Anything else - a manual invoke, a body we cannot read, a tenant id we
- * do not recognise - is a full sweep: being slow beats silently skipping an
- * IPSet.
+ * Which tenants this batch is about, from the `tenantId` each message carries.
+ * Anything unreadable or unrecognised falls back to a full sweep: being slow
+ * beats silently skipping an IPSet.
  */
 function parseBatch(event: SQSEvent): Batch {
   const tenants = new Set<string>();
@@ -159,10 +150,9 @@ async function reconcile(tenant: Tenant, desired: string[]): Promise<void> {
       Name: tenant.ipSetName,
       Scope: tenant.ipSetScope,
       Addresses: desired,
-      // Optimistic lock. Per-tenant message grouping should mean there is never
-      // a competing writer, so this is a belt-and-braces guard against a manual
-      // console edit landing mid-update: the call fails, the message is
-      // redelivered, and the next attempt reconciles from a fresh read.
+      // Per-tenant grouping already rules out a competing worker, so this only
+      // catches a console edit landing mid-update: the call fails, the message
+      // is redelivered, and the retry reconciles from a fresh read.
       LockToken: current.LockToken,
     }),
   );
@@ -177,10 +167,7 @@ async function reconcile(tenant: Tenant, desired: string[]): Promise<void> {
   );
 }
 
-/**
- * Reads one tenant's allowlists. A Query on that tenant's partition, so the cost
- * is bounded by the tenant's member count rather than by the size of the table.
- */
+/** A Query on one partition, so cost is bounded by tenant size, not table size. */
 async function readAllowlists(tenantId: string): Promise<Allowlist[]> {
   const allowlists: Allowlist[] = [];
   let startKey: Record<string, unknown> | undefined;
@@ -195,9 +182,8 @@ async function readAllowlists(tenantId: string): Promise<Allowlist[]> {
         ExpressionAttributeNames: { '#v': 'version' },
         ExpressionAttributeValues: { ':tenantId': tenantId },
         ExclusiveStartKey: startKey,
-        // Strongly consistent: a default (eventually consistent) read can miss
-        // the very write that triggered this invocation, which would publish a
-        // stale IPSet and leave it stale until the next tenant edit.
+        // An eventually consistent read can miss the very write that triggered
+        // this run, leaving a stale IPSet until the next edit.
         ConsistentRead: true,
       }),
     );
@@ -218,13 +204,10 @@ async function readAllowlists(tenantId: string): Promise<Allowlist[]> {
 }
 
 /**
- * Distinguishes slow from stuck. Reports how old this tenant's oldest
- * unacknowledged edit was at the moment the partition was read: a few seconds on
- * a healthy platform, growing sweep after sweep when something is wedged.
- *
- * Emitted before reconciling, so a tenant whose sync keeps failing still reports
- * - the number climbing is the whole signal. Embedded metric format, so it costs
- * a log line and needs no cloudwatch:PutMetricData.
+ * Tells slow from stuck: the age of this tenant's oldest unacknowledged edit,
+ * seconds on a healthy platform and climbing sweep after sweep when wedged.
+ * Emitted before reconciling, so a failing tenant still reports. Embedded metric
+ * format, so it costs a log line and no cloudwatch:PutMetricData.
  */
 function reportOldestUnacknowledged(tenantId: string, items: Allowlist[]): void {
   const ages = items
@@ -232,8 +215,8 @@ function reportOldestUnacknowledged(tenantId: string, items: Allowlist[]): void 
     .map((item) => Date.now() - Date.parse(item.updatedAt!))
     .filter((age) => Number.isFinite(age));
 
-  // Zero when nothing is outstanding, so the alarm always has a datapoint and
-  // recovery is visible rather than inferred from missing data.
+  // Zero rather than nothing, so the alarm always has a datapoint and recovery
+  // is visible instead of inferred from missing data.
   const oldest = ages.length === 0 ? 0 : Math.max(...ages);
 
   console.log(
@@ -257,13 +240,10 @@ function reportOldestUnacknowledged(tenantId: string, items: Allowlist[]): void 
 }
 
 /**
- * Records which version is live in WAF, so the API can report APPLIED instead
- * of guessing. Only unacknowledged items are written, so a routine sync of an
- * unchanged platform costs no writes.
- *
- * The conditional write keeps this honest: if the item was saved again between
- * the read and here, that newer version was never in the IPSet, so the update
- * is rejected and it correctly stays PENDING until its own message arrives.
+ * Records which version is live in WAF, so the API reports APPLIED rather than
+ * guessing. Only unacknowledged items are written, so an unchanged platform
+ * costs no writes. The condition keeps it honest: an item saved again since the
+ * read was never in this IPSet, so it is rejected and stays PENDING.
  */
 async function confirmApplied(tenantId: string, items: Allowlist[]): Promise<void> {
   const pending = items.filter((item) => item.syncedVersion !== item.version);
@@ -303,8 +283,8 @@ async function confirmApplied(tenantId: string, items: Allowlist[]): Promise<voi
     }),
   );
 
-  // WAF is already correct, so do not fail the batch over a bookkeeping write;
-  // the next sync retries it, and the tenant sees PENDING in the meantime.
+  // WAF is already correct, so do not fail the batch over bookkeeping; the next
+  // sync retries it and the tenant sees PENDING meanwhile.
   if (failed.length > 0) {
     console.error(
       JSON.stringify({

@@ -1,12 +1,9 @@
-// The allowlist table. One table for the whole platform.
+// The allowlist table, one for the whole platform. PK = tenantId / SK = ownerId,
+// so the worker reads a tenant with a Query on one partition, bounded by that
+// tenant's member count. Agencies sharing a tenant are separate items in it and
+// their ranges are the union.
 //
-// PK = tenantId, SK = ownerId. The sync worker reads a tenant with a Query on a
-// single partition, so its cost is bounded by that tenant's member count rather
-// than by the size of the platform. Agencies sharing a tenant are separate items
-// in the same partition, and their ranges are the union of that partition.
-//
-// No stream. The API is the only writer and posts its own signal to the queue,
-// so there is no change-capture hop to configure.
+// No stream: the API is the only writer and signals the queue itself.
 
 resource "aws_dynamodb_table" "this" {
   name         = var.table_name

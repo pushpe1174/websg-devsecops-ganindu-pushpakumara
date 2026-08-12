@@ -12,10 +12,9 @@ variable "environment" {
 
 variable "tenants" {
   description = <<-EOT
-    Tenants to provision. Each key creates one WAF IPSet named
-    "websg-cms-allowlist-<key>" and becomes a partition key in the shared
-    allowlist table. Agencies that must share an IPSet share a tenant key and
-    are separate items in that tenant's partition.
+    Tenants to provision. Each key creates one WAF IPSet "websg-cms-allowlist-<key>"
+    and becomes a partition key in the shared table. Agencies sharing an IPSet
+    share a key, as separate items in that partition.
   EOT
 
   type = map(object({
@@ -29,8 +28,7 @@ variable "break_glass_cidrs" {
   type        = list(string)
   default     = []
 
-  // The IPSets are IPV4, matching the API which rejects IPv6. A v6 range here
-  // would be accepted by Terraform and then fail every UpdateIPSet call.
+  // A v6 range would apply cleanly here and then fail every UpdateIPSet call.
   validation {
     condition     = alltrue([for cidr in var.break_glass_cidrs : can(regex("^([0-9]{1,3}\\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$", cidr))])
     error_message = "break_glass_cidrs must be IPv4 CIDRs; the IPSets are IPV4 only."

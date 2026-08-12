@@ -4,8 +4,7 @@
 locals {
   ip_set_arns = distinct([for t in var.tenants : t.ipSetArn])
 
-  // Runtime config: which IPSet belongs to which tenant. The table is a single
-  // name in the environment, not part of this map.
+  // Runtime config: which IPSet belongs to which tenant.
   tenant_config = {
     for id, t in var.tenants : id => {
       ipSetId    = t.ipSetId
@@ -56,8 +55,8 @@ data "aws_iam_policy_document" "this" {
     resources = [var.table_arn]
   }
 
-  // Records which version reached WAF, so the API can report APPLIED rather
-  // than guessing. Write access is limited to that acknowledgement.
+  // Only to record which version reached WAF, so the API reports APPLIED
+  // rather than guessing.
   statement {
     sid       = "AcknowledgeAppliedVersion"
     actions   = ["dynamodb:UpdateItem"]
@@ -81,8 +80,8 @@ data "aws_iam_policy_document" "this" {
     resources = local.ip_set_arns
   }
 
-  // The stuck-sync metric is emitted as embedded metric format on stdout, so
-  // logs:PutLogEvents is the only permission it needs - no cloudwatch:PutMetricData.
+  // The stuck-sync metric is embedded format on stdout, so this covers it -
+  // no cloudwatch:PutMetricData needed.
   statement {
     sid       = "WriteLogs"
     actions   = ["logs:CreateLogStream", "logs:PutLogEvents"]
@@ -140,8 +139,8 @@ resource "aws_lambda_event_source_mapping" "queue" {
 
   batch_size = 10
 
-  // The handler returns the ids of the messages it could not process instead of
-  // throwing. Without this, one tenant's failure returns all ten messages to the
-  // queue and ticks nine healthy tenants toward the DLQ threshold.
+  // The handler returns the ids it could not process instead of throwing.
+  // Without this, one tenant's failure returns all ten messages and ticks nine
+  // healthy tenants toward the DLQ threshold.
   function_response_types = ["ReportBatchItemFailures"]
 }

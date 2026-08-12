@@ -4,10 +4,7 @@ import type { Principal } from '../../lib/jwt.ts';
 import type { SyncNotifier } from './notifier.ts';
 import type { Allowlist, AllowlistRepository } from './repository.ts';
 
-/**
- * PENDING: stored, not yet confirmed live in AWS WAF.
- * APPLIED: the sync worker has confirmed this exact version is live in WAF.
- */
+/** PENDING: stored. APPLIED: the worker confirmed this version is live in WAF. */
 export type SyncStatus = 'PENDING' | 'APPLIED';
 
 export type AllowlistView = Allowlist & { tenantId: string; syncStatus: SyncStatus };
@@ -31,7 +28,7 @@ export type ServiceDeps = {
   logger?: ServiceLogger;
 };
 
-/** Business rules, free of HTTP concerns so they can be unit tested directly. */
+/** Business rules, free of HTTP so they unit test directly. */
 export function createAllowlistService({
   repository,
   notifier,
@@ -41,7 +38,7 @@ export function createAllowlistService({
   async function read({ userId, tenantId }: Principal): Promise<AllowlistView> {
     const record = await repository.get(tenantId, userId);
 
-    // Never-configured user: nothing outstanding, so nothing is pending.
+    // A never-configured user has nothing outstanding, so nothing pending.
     return view(
       tenantId,
       record ?? { ownerId: userId, cidrs: [], version: 0, updatedAt: '', syncedVersion: 0 },
@@ -52,7 +49,6 @@ export function createAllowlistService({
     get: read,
 
     async replace({ principal, cidrs, expectedVersion }) {
-      // Throws ValidationError with a reason per rejected entry.
       const normalized = normalizeAllowlist(cidrs, config.policy);
       const written = await repository.put(
         principal.tenantId,
@@ -60,10 +56,10 @@ export function createAllowlistService({
         expectedVersion,
       );
 
-      // The write and the signal are not atomic, and the write is the one that
-      // matters: it is durable, and the 15-minute sweep reconciles a tenant
-      // whose message never arrived. So a failed send is logged and answered
-      // PENDING rather than raised - the caller's edit is not lost, it is slow.
+      // The write and the signal are not atomic, and the write is the durable
+      // one: the 15-minute sweep reconciles a tenant whose message never
+      // arrived. So a failed send is logged, not raised - the edit is slow,
+      // not lost.
       try {
         await notifier.notify({
           tenantId: principal.tenantId,
@@ -77,9 +73,8 @@ export function createAllowlistService({
         );
       }
 
-      // Wait for the worker's acknowledgement so the caller gets a definitive
-      // answer instead of having to poll. The write is durable regardless; if
-      // the window elapses the answer is honestly PENDING.
+      // Wait for the acknowledgement so the caller gets a definitive answer
+      // rather than polling. If the window elapses the answer is just PENDING.
       const deadline = Date.now() + config.syncWaitMs;
       let current = view(principal.tenantId, written);
 
@@ -95,10 +90,7 @@ export function createAllowlistService({
   };
 }
 
-/**
- * Derived, never stored: the worker only records which version it applied, so
- * the status cannot disagree with the data it is computed from.
- */
+/** Derived, never stored, so the status cannot drift from the data behind it. */
 function view(tenantId: string, record: Allowlist): AllowlistView {
   return {
     ...record,

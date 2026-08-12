@@ -31,7 +31,7 @@ export function buildApp(options: AppOptions): FastifyInstance {
   registerErrorHandler(app);
   app.register(healthRoutes);
 
-  // Everything under /v1 is authenticated; health routes stay outside this scope.
+  // Everything under /v1 is authenticated; health stays outside this scope.
   app.register(
     async (api) => {
       registerAuthentication(api, options.verify);

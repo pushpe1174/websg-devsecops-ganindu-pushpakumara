@@ -8,12 +8,11 @@ export const config = {
   aws: {
     // One table for every tenant: PK = tenantId, SK = ownerId.
     tableName: process.env.TABLE_NAME ?? 'websg-cms-allowlist',
-    // The API signals the sync worker itself; there is no change-capture hop.
     syncQueueUrl: process.env.SYNC_QUEUE_URL,
   },
 
-  // How long a write waits for the worker to confirm the list is live in WAF
-  // before answering PENDING. The write itself is already durable either way.
+  // How long a write waits for WAF confirmation before answering PENDING. The
+  // write is durable either way.
   syncWaitMs: num(process.env.SYNC_WAIT_MS, 15000),
   syncPollMs: num(process.env.SYNC_POLL_MS, 500),
 
@@ -36,7 +35,7 @@ export type Config = typeof config;
 /** Fails fast at boot rather than on the first request. */
 export function assertConfig(current: Config = config): void {
   if (!current.jwt.secret) throw new Error('Missing required configuration: JWT_SECRET');
-  // Without it a write is still durable, but nothing tells the worker until the
-  // 15-minute sweep - so treat a missing queue as misconfiguration, not a mode.
+  // A write stays durable without it, but nothing tells the worker until the
+  // 15-minute sweep - so a missing queue is misconfiguration, not a mode.
   if (!current.aws.syncQueueUrl) throw new Error('Missing required configuration: SYNC_QUEUE_URL');
 }

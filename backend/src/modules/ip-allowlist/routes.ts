@@ -11,7 +11,7 @@ import type { AllowlistService } from './service.ts';
 const errors = (...codes: number[]) =>
   Object.fromEntries(codes.map((code) => [code, errorResponseSchema]));
 
-/** The caller's own allowlist. The token decides whose - there is no id in the path. */
+/** The caller's own allowlist - the token decides whose, no id in the path. */
 export function ipAllowlistRoutes(service: AllowlistService) {
   return async function routes(app: FastifyInstance) {
     app.get(
@@ -29,8 +29,8 @@ export function ipAllowlistRoutes(service: AllowlistService) {
         },
       },
       async (request, reply) => {
-        // Send the complete list; it replaces the stored one. If-Match carries
-        // the version last read (428 when absent, 409 when stale).
+        // Full replacement. If-Match carries the version last read: 428 when
+        // absent, 409 when stale.
         const expectedVersion = parseIfMatch(request.headers['if-match']);
 
         const record = await service.replace({
@@ -50,8 +50,8 @@ export function ipAllowlistRoutes(service: AllowlistService) {
           'allowlist updated',
         );
 
-        // 200 once WAF is confirmed updated; 202 if the wait elapsed first -
-        // stored and durable, but not yet acknowledged. Poll GET for APPLIED.
+        // 200 once WAF is confirmed; 202 if the wait elapsed first - durable,
+        // just unacknowledged, so poll GET for APPLIED.
         return reply
           .code(record.syncStatus === 'APPLIED' ? 200 : 202)
           .header('etag', String(record.version))

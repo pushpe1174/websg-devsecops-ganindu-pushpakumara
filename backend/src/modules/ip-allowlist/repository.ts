@@ -8,9 +8,8 @@ export type Allowlist = {
   version: number;
   updatedAt: string;
 
-  // Written by the sync worker once this version is live in AWS WAF. Absent
-  // until then, which is what makes a new write PENDING by construction - a
-  // stored status field could drift from reality; this cannot.
+  // Written by the worker once this version is live in WAF; absent until then,
+  // which makes a new write PENDING by construction rather than by a flag.
   syncedVersion?: number;
   syncedAt?: string;
 };
@@ -24,9 +23,8 @@ export interface AllowlistRepository {
 }
 
 /**
- * One table for the whole platform: PK = tenantId, SK = ownerId. A tenant is a
- * partition, so the sync worker reads one with a Query rather than scanning
- * every item on the platform.
+ * One table: PK = tenantId, SK = ownerId. A tenant is a partition, so the worker
+ * reads one with a Query instead of scanning the platform.
  */
 export function createDynamoRepository(tableName: string): AllowlistRepository {
   const client = DynamoDBDocumentClient.from(new DynamoDBClient({}));
@@ -37,8 +35,8 @@ export function createDynamoRepository(tableName: string): AllowlistRepository {
         new GetCommand({
           TableName: tableName,
           Key: { tenantId, ownerId },
-          // The caller is polling for the worker's acknowledgement, so a stale
-          // read would report PENDING on an already-applied list.
+          // The caller polls for the acknowledgement, so a stale read would
+          // report PENDING on an already-applied list.
           ConsistentRead: true,
         }),
       );
@@ -46,10 +44,9 @@ export function createDynamoRepository(tableName: string): AllowlistRepository {
     },
 
     async put(tenantId, draft, expectedVersion) {
-      // PutItem replaces the whole item, so `syncedVersion` is dropped and the
-      // new version starts unacknowledged - which is the truth: this version has
-      // not reached WAF yet. Merging it forward would report a new edit as
-      // already live.
+      // PutItem replaces the item, dropping `syncedVersion` so the new version
+      // starts unacknowledged - which is true, it has not reached WAF. Carrying
+      // it forward would report a fresh edit as already live.
       const item: Allowlist = {
         ...draft,
         version: expectedVersion + 1,

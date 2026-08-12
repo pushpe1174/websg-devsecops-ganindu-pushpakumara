@@ -5,16 +5,13 @@ import { ValidationError } from './errors.ts';
 type Policy = Config['policy'];
 
 /**
- * Validates and canonicalises tenant-submitted entries into WAF IPSet form.
- * Accepts a bare IPv4 address (widened to /32) or an explicit IPv4 CIDR.
- * Rejects: malformed input, non-routable ranges, ranges broader than policy,
- * and CIDRs whose host bits are set (WAF requires the network address).
+ * Canonicalises tenant entries into WAF IPSet form: a bare IPv4 address (widened
+ * to /32) or an explicit CIDR. Rejects malformed input, non-routable ranges,
+ * ranges broader than policy, and host bits set (WAF wants the network address).
  *
- * IPv6 is rejected. WAF IPSets are single-family and the ones this platform
- * provisions are IPV4, so accepting a v6 range here would store something the
- * infrastructure cannot hold - the address would be saved, reported PENDING, and
- * never go live. Supporting it properly means a second IPSet per tenant, family
- * routing in the sync worker, and both sets referenced from the CMS WebACL.
+ * IPv6 is rejected because WAF IPSets are single-family and these are IPV4 - a
+ * v6 range would store, report PENDING and never go live. Supporting it means a
+ * second IPSet per tenant, family routing in the worker, and both in the WebACL.
  */
 export function normalizeAllowlist(entries: string[], policy: Policy): string[] {
   if (entries.length > policy.maxEntries) {
@@ -43,8 +40,7 @@ function normalizeEntry(entry: string, policy: Policy): string {
   if (rest.length > 0) throw new Error('malformed CIDR');
 
   if (!isIPv4(address)) {
-    // Named separately from "not a valid IP address" so the caller can tell a
-    // typo from an unsupported address family.
+    // Separate message so a caller can tell a typo from an unsupported family.
     if (isIPv6(address)) throw new Error('IPv6 is not supported, use an IPv4 address or CIDR');
     throw new Error('not a valid IPv4 address');
   }
