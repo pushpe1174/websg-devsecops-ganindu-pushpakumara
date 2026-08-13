@@ -1,22 +1,8 @@
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand, PutCommand } from '@aws-sdk/lib-dynamodb';
-import { VersionConflictError } from '../../lib/errors.ts';
-
-export type Allowlist = {
-  ownerId: string;
-  cidrs: string[];
-  version: number;
-  updatedAt: string;
-  syncedVersion?: number;
-  syncedAt?: string;
-};
-
-export type AllowlistDraft = { ownerId: string; cidrs: string[] };
-
-export interface AllowlistRepository {
-  get(tenantId: string, ownerId: string): Promise<Allowlist | null>;
-  put(tenantId: string, draft: AllowlistDraft, expectedVersion: number): Promise<Allowlist>;
-}
+import type { Allowlist } from '../domain/allowlist.ts';
+import { VersionConflictError } from '../domain/errors.ts';
+import type { AllowlistRepository } from '../domain/ports.ts';
 
 /**
  * One table: PK = tenantId, SK = ownerId. A tenant is a partition, so the worker

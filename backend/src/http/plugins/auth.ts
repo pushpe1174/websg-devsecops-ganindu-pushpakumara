@@ -1,5 +1,6 @@
 import type { FastifyInstance } from 'fastify';
-import type { Principal, TokenVerifier } from '../lib/jwt.ts';
+import type { Principal } from '../../domain/allowlist.ts';
+import type { TokenVerifier } from '../../domain/ports.ts';
 
 declare module 'fastify' {
   interface FastifyRequest {

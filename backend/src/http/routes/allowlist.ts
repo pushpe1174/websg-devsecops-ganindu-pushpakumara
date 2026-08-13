@@ -1,18 +1,18 @@
 import type { FastifyInstance } from 'fastify';
-import { PreconditionRequiredError } from '../../lib/errors.ts';
+import { PreconditionRequiredError } from '../../domain/errors.ts';
+import type { AllowlistService } from '../../services/allowlist-service.ts';
 import {
   allowlistResponseSchema,
   errorResponseSchema,
   replaceBodySchema,
   type ReplaceBody,
-} from './schemas.ts';
-import type { AllowlistService } from './service.ts';
+} from '../schemas.ts';
 
 const errors = (...codes: number[]) =>
   Object.fromEntries(codes.map((code) => [code, errorResponseSchema]));
 
 /** The caller's own allowlist - the token decides whose, no id in the path. */
-export function ipAllowlistRoutes(service: AllowlistService) {
+export function allowlistRoutes(service: AllowlistService) {
   return async function routes(app: FastifyInstance) {
     app.get(
       '/allowlist',

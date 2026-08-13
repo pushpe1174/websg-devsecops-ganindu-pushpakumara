@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { ValidationError, VersionConflictError } from '../../src/lib/errors.ts';
-import type { Principal } from '../../src/lib/jwt.ts';
-import { createAllowlistService } from '../../src/modules/ip-allowlist/service.ts';
+import { ValidationError, VersionConflictError } from '../../src/domain/errors.ts';
+import type { Principal } from '../../src/domain/allowlist.ts';
+import { createAllowlistService } from '../../src/services/allowlist-service.ts';
 import { createMemoryNotifier, createMemoryRepository, testConfig } from '../helpers/index.ts';
 
 const userA: Principal = { userId: 'user-a', tenantId: 'tenant-a' };

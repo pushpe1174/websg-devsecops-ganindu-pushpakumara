@@ -1,13 +1,11 @@
 import cors from '@fastify/cors';
 import Fastify, { type FastifyInstance } from 'fastify';
-import { config as defaultConfig, type Config } from './config/index.ts';
-import type { TokenVerifier } from './lib/jwt.ts';
-import { ipAllowlistRoutes } from './modules/ip-allowlist/routes.ts';
-import type { AllowlistRepository } from './modules/ip-allowlist/repository.ts';
-import type { SyncNotifier } from './modules/ip-allowlist/notifier.ts';
-import { createAllowlistService } from './modules/ip-allowlist/service.ts';
+import { config as defaultConfig, type Config } from '../config/index.ts';
+import type { AllowlistRepository, SyncNotifier, TokenVerifier } from '../domain/ports.ts';
+import { createAllowlistService } from '../services/allowlist-service.ts';
 import { registerAuthentication } from './plugins/auth.ts';
 import { registerErrorHandler } from './plugins/error-handler.ts';
+import { allowlistRoutes } from './routes/allowlist.ts';
 import { authRoutes } from './routes/auth.ts';
 import { healthRoutes } from './routes/health.ts';
 
@@ -55,7 +53,7 @@ export function buildApp(options: AppOptions): FastifyInstance {
         config,
         logger: api.log,
       });
-      await api.register(ipAllowlistRoutes(service));
+      await api.register(allowlistRoutes(service));
     },
     { prefix: '/v1' },
   );

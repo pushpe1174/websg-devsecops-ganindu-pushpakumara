@@ -3,7 +3,7 @@ import {
   PreconditionRequiredError,
   ValidationError,
   VersionConflictError,
-} from '../lib/errors.ts';
+} from '../../domain/errors.ts';
 
 /** Single place mapping domain errors to HTTP, and the only error responder. */
 export function registerErrorHandler(app: FastifyInstance): void {

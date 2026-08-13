@@ -15,34 +15,42 @@ DynamoDB, so `TABLE_NAME` and `SYNC_QUEUE_URL` must point at real resources from
 
 ## Layout
 
+Four layers, each folder one of them. Dependencies point one way only —
+`http → services → domain`, with `infra` plugging into `domain`'s interfaces.
+
 ```
 src/
 ├── server.ts       starts the process: real DynamoDB, real SQS, listen, shut down cleanly
-├── app.ts          the wiring — which plugins, in which order, on which routes
 ├── config/
 │   ├── index.ts    every environment variable, read once, in one place
 │   └── users.ts    the user → tenant directory
-├── routes/
-│   ├── health.ts   /healthz, /readyz — no token
-│   └── auth.ts     password-less sign-in for the portal
-├── plugins/        cross-cutting concerns, not one endpoint's business
-│   ├── auth.ts             verifies the token, sets request.principal
-│   └── error-handler.ts    the only place an error becomes a response
-├── lib/            pure helpers — no HTTP, no AWS, trivially testable
-│   ├── cidr.ts     what may go on a list at all
-│   ├── jwt.ts      sign and verify
-│   └── errors.ts   the error types the handler maps to status codes
-└── modules/ip-allowlist/    the feature itself, in layers
-    ├── routes.ts       HTTP: paths, status codes, If-Match
-    ├── service.ts      the rules: validate, write, wait for the edge
-    ├── repository.ts   DynamoDB, and nothing else
-    └── notifier.ts     SQS, and nothing else
+├── domain/         the feature in the abstract — no HTTP, no AWS, no framework
+│   ├── allowlist.ts    what a list is, and how its sync status is derived
+│   ├── cidr.ts         what may go on a list at all
+│   ├── errors.ts       the error types the handler maps to status codes
+│   └── ports.ts        what the service needs from outside, without naming a vendor
+├── services/       the use cases
+│   └── allowlist-service.ts   validate, write, signal, wait for the edge
+├── infra/          the ports, implemented against real vendors
+│   ├── dynamo-repository.ts   DynamoDB, and nothing else
+│   ├── sqs-notifier.ts        SQS, and nothing else
+│   └── tokens.ts              HS256 sign and verify
+└── http/           the transport — paths, status codes, headers, schemas
+    ├── app.ts              the wiring: which plugins, in which order, on which routes
+    ├── schemas.ts          every request and response shape, validated by Fastify
+    ├── routes/
+    │   ├── allowlist.ts    GET/PUT /v1/allowlist, If-Match, 200 vs 202
+    │   ├── auth.ts         password-less sign-in for the portal
+    │   └── health.ts       /healthz, /readyz — no token
+    └── plugins/            cross-cutting concerns, not one endpoint's business
+        ├── auth.ts             verifies the token, sets request.principal
+        └── error-handler.ts    the only place an error becomes a response
 ```
 
-The layering in that last folder is the point: `routes` knows HTTP, `service`
-knows the rules, `repository` and `notifier` know AWS. The service never
-mentions DynamoDB, so the tests hand it an in-memory version and never touch a
-cloud.
+That direction is the point. The service depends on `domain/ports.ts`, never on
+DynamoDB, so the tests hand it an in-memory repository and never touch a cloud.
+`server.ts` is the only file that knows both halves: it picks the real
+implementations and hands them to `buildApp`.
 
 ```
 scripts/   one-off tools: token.ts

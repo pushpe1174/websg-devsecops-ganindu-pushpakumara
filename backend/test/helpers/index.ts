@@ -1,10 +1,10 @@
 import { SignJWT } from 'jose';
-import { buildApp } from '../../src/app.ts';
+import { buildApp } from '../../src/http/app.ts';
 import { config } from '../../src/config/index.ts';
-import { createVerifier } from '../../src/lib/jwt.ts';
-import { VersionConflictError } from '../../src/lib/errors.ts';
-import type { Allowlist, AllowlistRepository } from '../../src/modules/ip-allowlist/repository.ts';
-import type { SyncNotifier, SyncSignal } from '../../src/modules/ip-allowlist/notifier.ts';
+import { createVerifier } from '../../src/infra/tokens.ts';
+import { VersionConflictError } from '../../src/domain/errors.ts';
+import type { Allowlist, SyncSignal } from '../../src/domain/allowlist.ts';
+import type { AllowlistRepository, SyncNotifier } from '../../src/domain/ports.ts';
 
 export const testConfig = {
   ...config,
