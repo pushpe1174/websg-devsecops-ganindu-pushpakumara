@@ -1,10 +1,5 @@
 import { SendMessageCommand, SQSClient } from '@aws-sdk/client-sqs';
-
-export type SyncSignal = { tenantId: string; ownerId: string; version: number };
-
-export interface SyncNotifier {
-  notify(signal: SyncSignal): Promise<void>;
-}
+import type { SyncNotifier } from '../domain/ports.ts';
 
 export function createSqsNotifier(queueUrl: string): SyncNotifier {
   const client = new SQSClient({});

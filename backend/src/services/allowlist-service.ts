@@ -1,13 +1,12 @@
-import type { Config } from '../../config/index.ts';
-import { normalizeAllowlist } from '../../lib/cidr.ts';
-import type { Principal } from '../../lib/jwt.ts';
-import type { SyncNotifier } from './notifier.ts';
-import type { Allowlist, AllowlistRepository } from './repository.ts';
-
-/** PENDING: stored. APPLIED: the worker confirmed this version is live in WAF. */
-export type SyncStatus = 'PENDING' | 'APPLIED';
-
-export type AllowlistView = Allowlist & { tenantId: string; syncStatus: SyncStatus };
+import type { Config } from '../config/index.ts';
+import {
+  emptyAllowlist,
+  toView,
+  type AllowlistView,
+  type Principal,
+} from '../domain/allowlist.ts';
+import { normalizeAllowlist } from '../domain/cidr.ts';
+import type { AllowlistRepository, ServiceLogger, SyncNotifier } from '../domain/ports.ts';
 
 export interface AllowlistService {
   get(principal: Principal): Promise<AllowlistView>;
@@ -18,8 +17,6 @@ export interface AllowlistService {
   }): Promise<AllowlistView>;
 }
 
-export type ServiceLogger = { error(context: object, message: string): void };
-
 export type ServiceDeps = {
   repository: AllowlistRepository;
   notifier: SyncNotifier;
@@ -27,6 +24,7 @@ export type ServiceDeps = {
   logger?: ServiceLogger;
 };
 
+/** The rules of a write, with no HTTP and no AWS anywhere in sight. */
 export function createAllowlistService({
   repository,
   notifier,
@@ -35,10 +33,7 @@ export function createAllowlistService({
 }: ServiceDeps): AllowlistService {
   async function read({ userId, tenantId }: Principal): Promise<AllowlistView> {
     const record = await repository.get(tenantId, userId);
-    return view(
-      tenantId,
-      record ?? { ownerId: userId, cidrs: [], version: 0, updatedAt: '', syncedVersion: 0 },
-    );
+    return toView(tenantId, record ?? emptyAllowlist(userId));
   }
 
   return {
@@ -68,7 +63,7 @@ export function createAllowlistService({
       // Wait for the acknowledgement so the caller gets a definitive answer
       // rather than polling. If the window elapses the answer is just PENDING.
       const deadline = Date.now() + config.syncWaitMs;
-      let current = view(principal.tenantId, written);
+      let current = toView(principal.tenantId, written);
 
       while (current.syncStatus === 'PENDING' && Date.now() < deadline) {
         await sleep(config.syncPollMs);
@@ -79,15 +74,6 @@ export function createAllowlistService({
 
       return current;
     },
-  };
-}
-
-/** Derived, never stored, so the status cannot drift from the data behind it. */
-function view(tenantId: string, record: Allowlist): AllowlistView {
-  return {
-    ...record,
-    tenantId,
-    syncStatus: record.syncedVersion === record.version ? 'APPLIED' : 'PENDING',
   };
 }
 

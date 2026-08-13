@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { normalizeAllowlist } from '../../src/lib/cidr.ts';
-import { ValidationError } from '../../src/lib/errors.ts';
+import { normalizeAllowlist } from '../../src/domain/cidr.ts';
+import { ValidationError } from '../../src/domain/errors.ts';
 import { testConfig } from '../helpers/index.ts';
 
 const normalize = (entries: string[]) => normalizeAllowlist(entries, testConfig.policy);
