@@ -8,7 +8,7 @@
         "dynamodb:GetItem",
         "dynamodb:PutItem"
       ],
-      "Resource": "arn:aws:dynamodb:ap-southeast-1:273804046957:table/websg-cms-allowlist"
+      "Resource": "arn:aws:dynamodb:ap-southeast-1:<ACCOUNT_ID>:table/websg-cms-allowlist"
     },
     {
       "Sid": "SignalSyncWorker",
@@ -17,7 +17,7 @@
         "sqs:SendMessage",
         "sqs:GetQueueUrl"
       ],
-      "Resource": "arn:aws:sqs:ap-southeast-1:273804046957:websg-cms-allowlist-waf-sync.fifo"
+      "Resource": "arn:aws:sqs:ap-southeast-1:<ACCOUNT_ID>:websg-cms-allowlist-waf-sync.fifo"
     }
   ]
 }

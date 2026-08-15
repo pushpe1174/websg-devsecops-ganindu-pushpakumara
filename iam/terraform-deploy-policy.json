@@ -15,7 +15,7 @@
               "s3:GetBucketPublicAccessBlock",
               "s3:PutBucketPublicAccessBlock"
           ],
-          "Resource": "arn:aws:s3:::websg-custom-tfstate-273804046957"
+          "Resource": "arn:aws:s3:::websg-custom-tfstate-<ACCOUNT_ID>"
       },
       {
           "Sid": "TerraformStateObjectsAndLock",
@@ -25,7 +25,7 @@
               "s3:PutObject",
               "s3:DeleteObject"
           ],
-          "Resource": "arn:aws:s3:::websg-custom-tfstate-273804046957/websg-custom/*"
+          "Resource": "arn:aws:s3:::websg-custom-tfstate-<ACCOUNT_ID>/websg-custom/*"
       },
       {
           "Sid": "AllowlistTable",
@@ -43,7 +43,7 @@
               "dynamodb:UntagResource"
           ],
           "Resource": [
-              "arn:aws:dynamodb:ap-southeast-1:273804046957:table/websg-cms-allowlist"
+              "arn:aws:dynamodb:ap-southeast-1:<ACCOUNT_ID>:table/websg-cms-allowlist"
           ]
       },
       {
@@ -60,8 +60,8 @@
               "sqs:UntagQueue"
           ],
           "Resource": [
-              "arn:aws:sqs:ap-southeast-1:273804046957:websg-cms-allowlist-waf-sync.fifo",
-              "arn:aws:sqs:ap-southeast-1:273804046957:websg-cms-allowlist-waf-sync-dlq.fifo"
+              "arn:aws:sqs:ap-southeast-1:<ACCOUNT_ID>:websg-cms-allowlist-waf-sync.fifo",
+              "arn:aws:sqs:ap-southeast-1:<ACCOUNT_ID>:websg-cms-allowlist-waf-sync-dlq.fifo"
           ]
       },
       {
@@ -83,7 +83,7 @@
               "lambda:UntagResource",
               "lambda:ListTags"
           ],
-          "Resource": "arn:aws:lambda:ap-southeast-1:273804046957:function:websg-cms-allowlist-waf-sync"
+          "Resource": "arn:aws:lambda:ap-southeast-1:<ACCOUNT_ID>:function:websg-cms-allowlist-waf-sync"
       },
       {
           "Sid": "SyncFunctionEventSourceMapping",
@@ -106,8 +106,8 @@
               "lambda:ListTags"
           ],
           "Resource": [
-              "arn:aws:lambda:ap-southeast-1:273804046957:function:websg-cms-allowlist-waf-sync",
-              "arn:aws:lambda:ap-southeast-1:273804046957:event-source-mapping:*"
+              "arn:aws:lambda:ap-southeast-1:<ACCOUNT_ID>:function:websg-cms-allowlist-waf-sync",
+              "arn:aws:lambda:ap-southeast-1:<ACCOUNT_ID>:event-source-mapping:*"
           ]
       },
       {
@@ -127,13 +127,13 @@
               "iam:TagRole",
               "iam:UntagRole"
           ],
-          "Resource": "arn:aws:iam::273804046957:role/websg-cms-allowlist-*"
+          "Resource": "arn:aws:iam::<ACCOUNT_ID>:role/websg-cms-allowlist-*"
       },
       {
           "Sid": "PassExecutionRolesToTheirOwnServiceOnly",
           "Effect": "Allow",
           "Action": "iam:PassRole",
-          "Resource": "arn:aws:iam::273804046957:role/websg-cms-allowlist-*",
+          "Resource": "arn:aws:iam::<ACCOUNT_ID>:role/websg-cms-allowlist-*",
           "Condition": {
               "StringEquals": {
                   "iam:PassedToService": "lambda.amazonaws.com"
@@ -152,7 +152,7 @@
               "logs:TagResource",
               "logs:UntagResource"
           ],
-          "Resource": "arn:aws:logs:ap-southeast-1:273804046957:log-group:/aws/lambda/websg-cms-allowlist-waf-sync*"
+          "Resource": "arn:aws:logs:ap-southeast-1:<ACCOUNT_ID>:log-group:/aws/lambda/websg-cms-allowlist-waf-sync*"
       },
       {
           "Sid": "GlobalLogGroupDiscovery",
@@ -178,7 +178,7 @@
               "sns:TagResource",
               "sns:UntagResource"
           ],
-          "Resource": "arn:aws:sns:ap-southeast-1:273804046957:websg-cms-allowlist-alerts"
+          "Resource": "arn:aws:sns:ap-southeast-1:<ACCOUNT_ID>:websg-cms-allowlist-alerts"
       },
       {
           "Sid": "Alarms",
@@ -191,7 +191,7 @@
               "cloudwatch:TagResource",
               "cloudwatch:UntagResource"
           ],
-          "Resource": "arn:aws:cloudwatch:ap-southeast-1:273804046957:alarm:websg-cms-allowlist-*"
+          "Resource": "arn:aws:cloudwatch:ap-southeast-1:<ACCOUNT_ID>:alarm:websg-cms-allowlist-*"
       },
       {
           "Sid": "ManageTenantIpSets",
@@ -221,7 +221,7 @@
               "events:TagResource",
               "events:UntagResource"
           ],
-          "Resource": "arn:aws:events:ap-southeast-1:273804046957:rule/websg-cms-allowlist-waf-sync-drift-check"
+          "Resource": "arn:aws:events:ap-southeast-1:<ACCOUNT_ID>:rule/websg-cms-allowlist-waf-sync-drift-check"
       }
   ]
 }
